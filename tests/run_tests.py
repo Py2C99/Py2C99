@@ -24,13 +24,19 @@ CASES = [
     "optstest.py",
     "itertoolstest.py",
     "modules.py",
+    "fstrings.py",
+    "builtins311.py",
+    "stdlib_extra.py",
+    "hashlib311.py",
 ]
 GUI_CASES = ["gui_smoke.py", "invoke_test.py"]
 
 
 def run(cmd, cwd=ROOT, timeout=60):
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
-        p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=timeout)
         out = p.stdout.decode("utf-8", "replace")
         return p.returncode, out
@@ -75,6 +81,10 @@ def main():
         name_exe = os.path.splitext(name)[0] + ".exe"
         code, build_out = run([sys.executable, os.path.join(ROOT, "py2c99.py"),
                                path, "-o", name_exe], timeout=120)
+        # gcc warnings are written to stderr, which run() merges into stdout.
+        # They are not part of the compiled program's output.
+        if code == 0:
+            build_out = ""
         if code != 0:
             ok = False
             out = build_out
@@ -96,6 +106,14 @@ def main():
                         print("  line %d: expected %r, got %r" % (i + 1, e, a))
                         break
     failed += repl_case()
+    code, out = run([sys.executable, os.path.join(ROOT, "tests",
+                                                  "test_coverage311.py")],
+                    timeout=180)
+    print(("PASS " if code == 0 else "FAIL ") + "coverage311")
+    if code != 0:
+        failed += 1
+        print("  exit: %d" % code)
+        print(out)
     print("%d failure(s)" % failed)
     return 1 if failed else 0
 
