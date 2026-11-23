@@ -170,6 +170,9 @@ typedef struct PyVal {
         struct {
             int kind;
             char *msg;
+            PyVal *cls;   /* Python class for user-defined exceptions */
+            PyVal *args;  /* tuple passed to the constructor */
+            PyVal *attrs; /* instance dictionary of a user exception */
         } exc;
         struct {
             PyVal *value;
@@ -252,6 +255,8 @@ PyVal *py_bound(PyVal *fn, PyVal *self);
 PyVal *py_var(PyVal *value, const char *name);
 PyVal *py_class(PyVal *dict, const char *name);
 void py_class_inherit(PyVal *dict, PyVal *base);
+int py_class_is_subclass(PyVal *cls, PyVal *base);
+PyVal *py_exc_class(const char *name);
 PyVal *py_widget_value(PyWidget *w);
 PyVal *py_guimethod(PyWidget *w, const char *name);
 
@@ -263,6 +268,7 @@ const char *py_cstr(PyVal *v); /* borrowed UTF-8 view */
 size_t py_cstr_len(PyVal *v);
 PyVal *py_str_of(PyVal *v);   /* str(v) */
 PyVal *py_repr(PyVal *v);     /* repr(v) */
+PyVal *py_ascii_of(PyVal *v); /* ascii(v): repr with non-ASCII escaped */
 PyVal *py_type(PyVal *v);     /* type object (a string-like descriptor) */
 
 /* Assignment helper: retains new value, releases old one. */
@@ -368,6 +374,10 @@ int py_exc_matches_name(PyVal *exc, const char *name);
 const char *py_exc_name(int exctype);
 PyVal *py_make_exc(int exctype, const char *msg);
 PyVal *py_make_exc_val(int exctype, PyVal *msg);
+/* Convert a class or an instance of a user exception class into PY_T_EXC.
+   Returns a new reference, or NULL when v is not exception-like. */
+PyVal *py_exc_from_value(PyVal *v);
+int py_exc_matches_class(PyVal *exc, PyVal *cls);
 
 /* ------------------------------------------------------- calling conventions */
 PyVal *py_args_tail(PyVal **args, size_t argc, size_t nfixed);
@@ -399,12 +409,36 @@ PyVal *py_stdlib_const(const char *module, const char *name);
 PyVal *py_stdlib_call(const char *module, const char *name, PyVal **args,
                       size_t argc, PyVal *kwargs, int *handled);
 
+/* Exhaustive, generated Python 3.11 registries (runtime/pyrt_311.c).
+   These make every 3.11 builtin and stdlib module name available to the
+   compiler; modules without a native implementation raise a clear
+   NotImplementedError when a function is actually called. */
+int py311_is_builtin(const char *name);
+int py311_is_stdlib_module(const char *module);
+const char *py311_canonical_module(const char *module);
+PyVal *py311_builtin_names(void);
+PyVal *py311_module_names(void);
+PyVal *py311_builtin_get(const char *name);
+PyVal *py311_builtin_const(const char *name);
+PyVal *py311_module_const(const char *module, const char *name);
+PyVal *py311_module_call(const char *module, const char *name, PyVal **args,
+                         size_t argc, PyVal *kwargs, int *handled);
+
+/* Second wave of pure-C Python 3.11 standard-library modules. */
+int py_extra_module_known(const char *module);
+PyVal *py_extra_const(const char *module, const char *name);
+PyVal *py_extra_call(const char *module, const char *name, PyVal **args,
+                     size_t argc, PyVal *kwargs, int *handled);
+void py_extra_run_atexit(void);
+PyVal *py_builtin_extra_lookup(const char *name);
+
 /* --------------------------------------------------------- generated helpers */
 PyVal *py_load(PyVal **slot, const char *name); /* retained or NameError */
 PyVal *py_env_get(PyVal *env, const char *name); /* retained or NameError */
 PyVal *py_builtin_lookup(const char *name);     /* retained function or NULL */
 PyVal *py_call_list(PyVal *fn, PyVal *poslist, PyVal *kwargs);
 PyVal *py_format_value(PyVal *value, const char *spec, int conv);
+PyVal *py_format_value_obj(PyVal *value, PyVal *spec, int conv);
 
 /* -------------------------------------------------------------------- misc */
 void py_print_exc(PyVal *exc);

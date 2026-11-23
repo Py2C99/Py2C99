@@ -11,6 +11,7 @@
 #include <time.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 
@@ -44,6 +45,11 @@ static PyVal *g_argv = NULL;
 static PyVal *file_method(PyVal *f, const char *name, PyVal **args, size_t argc,
                           PyVal *kwargs);
 static PyVal *file_readline(PyVal *f);
+static PyVal *map_get_cstr(PyVal *d, const char *name);
+static void map_put_cstr(PyVal *d, const char *name, PyVal *value);
+static PyVal *class_attr(PyVal *cls, const char *name);
+static const char *class_name_of(PyVal *cls);
+static const char *exc_type_name(PyVal *exc);
 
 /* ---------------------------------------------------------------- buffers */
 typedef struct {
@@ -70,6 +76,11 @@ static void buf_reserve(Buf *b, size_t extra) {
 }
 
 static void buf_add(Buf *b, const char *s, size_t n) {
+    if (n == (size_t)-1) {
+        fputs("py2c99: internal buffer length overflow\n", stderr);
+        exit(1);
+    }
+    if (!n) return;
     buf_reserve(b, n);
     memcpy(b->data + b->len, s, n);
     b->len += n;
@@ -327,16 +338,42 @@ PyVal *py_class(PyVal *dict, const char *name) {
     py_retain(dict);
     return v;
 }
+
+static void class_add_base(PyVal *dict, PyVal *base) {
+    PyVal *bases = map_get_cstr(dict, "__bases__");
+    if (!bases) {
+        bases = py_list_new();
+        map_put_cstr(dict, "__bases__", bases);
+        py_release(bases);
+        bases = map_get_cstr(dict, "__bases__");
+    }
+    if (bases && bases->type == PY_T_LIST) py_list_append(bases, base);
+}
+
 void py_class_inherit(PyVal *dict, PyVal *base) {
     size_t i;
+    PyVal *owned = NULL;
     if (!dict || dict->type != PY_T_DICT) return;
-    if (!base || base->type != PY_T_CLASS) return;
+    if (!base) return;
+    /* A builtin exception name is a class as far as class definitions go. */
+    if (base->type == PY_T_STR) {
+        owned = py_exc_class(base->u.s.data);
+        if (!owned) return;
+        base = owned;
+    }
+    if (base->type != PY_T_CLASS) return;
     for (i = 0; i < base->u.klass.dict->u.map.len; i++) {
         PyVal *k = base->u.klass.dict->u.map.keys[i];
         PyVal *v = base->u.klass.dict->u.map.vals[i];
-        if (k && k->type == PY_T_STR)
-            py_dict_put(dict, k->u.s.data, v);
+        if (!k || k->type != PY_T_STR) continue;
+        /* These are rebuilt for the derived class, never copied verbatim. */
+        if (!strcmp(k->u.s.data, "__bases__") ||
+            !strcmp(k->u.s.data, "__name__") ||
+            !strcmp(k->u.s.data, "__class__")) continue;
+        py_dict_put(dict, k->u.s.data, v);
     }
+    class_add_base(dict, base);
+    py_release(owned);
 }
 PyVal *py_widget_value(PyWidget *w) {
     PyVal *v = val_new(PY_T_WIDGET);
@@ -396,6 +433,9 @@ void py_release_impl(PyVal *v) {
         break;
     case PY_T_EXC:
         free(v->u.exc.msg);
+        py_release(v->u.exc.cls);
+        py_release(v->u.exc.args);
+        py_release(v->u.exc.attrs);
         break;
     case PY_T_VAR:
         py_release(v->u.var.value);
@@ -1316,7 +1356,15 @@ static void repr_into(Buf *b, PyVal *v, int depth) {
     case PY_T_WIDGET: buf_adds(b, "<tkinter widget>"); break;
     case PY_T_FILE: buf_adds(b, "<file>"); break;
     case PY_T_VAR: buf_adds(b, "<tkinter variable>"); break;
-    case PY_T_EXC: buf_printf(b, "%s(%s)", py_exc_name(v->u.exc.kind), v->u.exc.msg); break;
+    case PY_T_EXC: {
+        PyVal *m = py_str(v->u.exc.msg ? v->u.exc.msg : "");
+        buf_adds(b, exc_type_name(v));
+        buf_addc(b, '(');
+        repr_string(b, m);
+        buf_addc(b, ')');
+        py_release(m);
+        break;
+    }
     case PY_T_ITER: buf_adds(b, "<iterator>"); break;
     case PY_T_SLICE:
         buf_adds(b, "slice(");
@@ -1350,6 +1398,27 @@ PyVal *py_repr(PyVal *v) {
     r = py_strn(b.data ? b.data : "", b.len);
     free(b.data);
     return r;
+}
+
+PyVal *py_ascii_of(PyVal *v) {
+    PyVal *r = py_repr(v), *out;
+    const char *p = py_cstr(r);
+    size_t n = py_cstr_len(r), i = 0;
+    Buf b;
+    buf_init(&b);
+    while (i < n) {
+        size_t adv = 1;
+        uint32_t cp = u8_decode(p + i, n - i, &adv);
+        if (cp < 0x80) buf_addc(&b, (char)cp);
+        else if (cp <= 0xFF) buf_printf(&b, "\\x%02x", cp);
+        else if (cp <= 0xFFFF) buf_printf(&b, "\\u%04x", cp);
+        else buf_printf(&b, "\\U%08x", cp);
+        i += adv;
+    }
+    out = py_strn(b.data ? b.data : "", b.len);
+    free(b.data);
+    py_release(r);
+    return out;
 }
 
 PyVal *py_str_of(PyVal *v) {
@@ -1431,7 +1500,10 @@ static const char *type_name(PyVal *v) {
     case PY_T_RANGE: return "range";
     case PY_T_WIDGET: return "tkinter.Widget";
     case PY_T_FILE: return "file";
-    case PY_T_EXC: return "Exception";
+    case PY_T_EXC: {
+        const char *n = class_name_of(v->u.exc.cls);
+        return n ? n : py_exc_name(v->u.exc.kind);
+    }
     case PY_T_VAR: return "tkinter.Variable";
     case PY_T_CLASS: return v->u.klass.name ? v->u.klass.name->u.s.data : "type";
     case PY_T_DICTVIEW: return v->u.view.kind == 0 ? "dict_keys" :
@@ -1442,7 +1514,16 @@ static const char *type_name(PyVal *v) {
 }
 
 PyVal *py_type(PyVal *v) {
-    PyVal *cls = val_new(PY_T_CLASS);
+    PyVal *cls;
+    if (v && v->type == PY_T_EXC) {
+        if (v->u.exc.cls) { py_retain(v->u.exc.cls); return v->u.exc.cls; }
+        return py_exc_class(py_exc_name(v->u.exc.kind));
+    }
+    if (v && v->type == PY_T_DICT) {
+        cls = map_get_cstr(v, "__class__");
+        if (cls && cls->type == PY_T_CLASS) { py_retain(cls); return cls; }
+    }
+    cls = val_new(PY_T_CLASS);
     cls->u.klass.name = py_str(type_name(v));
     cls->u.klass.dict = py_dict_new();
     return cls;
@@ -1476,23 +1557,55 @@ PyVal *py_getattr(PyVal *obj, const char *name) {
     if (!obj) py_raise(PY_EXC_ATTRIBUTE, "'NoneType' object has no attribute");
     if (obj->type == PY_T_WIDGET)
         return py_gui_getattr(obj->u.widget.w, name);
+    if (obj->type == PY_T_EXC) {
+        if (obj->u.exc.attrs) {
+            PyVal *a = map_get_cstr(obj->u.exc.attrs, name);
+            if (a) { py_retain(a); return a; }
+        }
+        if (!strcmp(name, "args"))
+            return obj->u.exc.args ? py_retain(obj->u.exc.args), obj->u.exc.args
+                                   : py_tuple_from(NULL, 0);
+        if (!strcmp(name, "message") || !strcmp(name, "msg"))
+            return py_str(obj->u.exc.msg ? obj->u.exc.msg : "");
+        if (!strcmp(name, "__class__")) {
+            if (obj->u.exc.cls) { py_retain(obj->u.exc.cls); return obj->u.exc.cls; }
+            return py_exc_class(py_exc_name(obj->u.exc.kind));
+        }
+        if (!strcmp(name, "__name__")) {
+            const char *n = class_name_of(obj->u.exc.cls);
+            return py_str(n ? n : py_exc_name(obj->u.exc.kind));
+        }
+    }
     if (obj->type == PY_T_DICT) {
         PyVal *r = map_get_cstr(obj, name);
         PyVal *cls;
         if (r) { py_retain(r); return r; }
         cls = map_get_cstr(obj, "__class__");
         if (cls && cls->type == PY_T_CLASS) {
-            r = map_get_cstr(cls->u.klass.dict, name);
+            r = class_attr(cls, name);
             if (r) {
                 if (r->type == PY_T_FUNC) return py_bound(r, obj);
                 py_retain(r);
                 return r;
             }
         }
+        if (!strcmp(name, "__class__") && cls) { py_retain(cls); return cls; }
+        /* Objects returned by __import__ carry the module name here.  Missing
+           attributes resolve through the normal module dispatch, so dynamic
+           imports get the same functions as a compile-time `import`. */
+        {
+            PyVal *mod = map_get_cstr(obj, "__py_module__");
+            if (mod && mod->type == PY_T_STR)
+                return py_module_attr(mod->u.s.data, name);
+        }
     }
     if (obj->type == PY_T_CLASS) {
-        PyVal *r = map_get_cstr(obj->u.klass.dict, name);
+        PyVal *r;
+        if (!strcmp(name, "__name__"))
+            return py_str(class_name_of(obj) ? class_name_of(obj) : "type");
+        r = class_attr(obj, name);
         if (r) { py_retain(r); return r; }
+        if (!strcmp(name, "__bases__")) return py_list_new();
     }
     if (obj->type == PY_T_RANGE) {
         if (strcmp(name, "start") == 0) return py_int(obj->u.range.start);
@@ -1509,9 +1622,13 @@ PyVal *py_getattr(PyVal *obj, const char *name) {
     }
     return py_none();
 }
-
 void py_setattr(PyVal *obj, const char *name, PyVal *value) {
     if (!obj) py_raise(PY_EXC_ATTRIBUTE, "cannot set attribute on None");
+    if (obj->type == PY_T_EXC) {
+        if (!obj->u.exc.attrs) obj->u.exc.attrs = py_dict_new();
+        map_put_cstr(obj->u.exc.attrs, name, value);
+        return;
+    }
     if (obj->type == PY_T_WIDGET) { py_gui_setattr(obj->u.widget.w, name, value); return; }
     if (obj->type == PY_T_DICT) { map_put_cstr(obj, name, value); return; }
     if (obj->type == PY_T_CLASS) { map_put_cstr(obj->u.klass.dict, name, value); return; }
@@ -1722,8 +1839,12 @@ PyVal *py_call(PyVal *fn, PyVal **args, size_t argc, PyVal *kwargs) {
     if (fn->type == PY_T_CLASS) {        PyVal *inst = py_dict_new();
         PyVal *init;
         PyVal *k = py_str("__class__");
+        PyVal *argtup;
         map_put(inst, k, fn);
         py_release(k);
+        argtup = py_tuple_from(args, argc);
+        map_put_cstr(inst, "__args__", argtup);
+        py_release(argtup);
         init = map_get_cstr(fn->u.klass.dict, "__init__");
         if (init) {
             PyVal *b = py_bound(init, inst);
@@ -2551,7 +2672,7 @@ PyVal *py_method(PyVal *obj, const char *name, PyVal **args, size_t argc,
         return file_method(obj, name, args, argc, kwargs);
     if (obj->type == PY_T_DICT) {
         PyVal *cls = map_get_cstr(obj, "__class__");
-        if (cls) {
+        if (cls || map_get_cstr(obj, "__py_module__")) {
             PyVal *m = py_getattr(obj, name);
             PyVal *r = py_call(m, args, argc, kwargs);
             py_release(m);
@@ -2649,7 +2770,8 @@ PyVal *py_input(PyVal **args, size_t argc, PyVal *kwargs) {
     }
     if (!got && b.len == 0) {
         free(b.data);
-        return py_str("");
+        py_raise(PY_EXC_EOF, "EOF when reading a line");
+        return py_none();
     }
     r = py_strn(b.data ? b.data : "", b.len);
     free(b.data);
@@ -2671,8 +2793,16 @@ PyVal *py_builtin_int(PyVal **args, size_t argc, PyVal *kwargs) {
         long long v;
         const char *s = args[0]->u.s.data;
         while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+        if ((base != 0 && (base < 2 || base > 36)) || !*s) {
+            py_raise(PY_EXC_VALUE, "invalid literal for int()");
+            return py_none();
+        }
         v = strtoll(s, &end, base);
-        if (end == s) py_raise(PY_EXC_VALUE, "invalid literal for int()");
+        while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+        if (end == s || *end) {
+            py_raise(PY_EXC_VALUE, "invalid literal for int()");
+            return py_none();
+        }
         return py_int((int64_t)v);
     }
     return py_int(py_as_int(args[0]));
@@ -2774,46 +2904,62 @@ PyVal *py_builtin_abs(PyVal **args, size_t argc, PyVal *kwargs) {
 }
 
 static PyVal *minmax(PyVal **args, size_t argc, PyVal *kwargs, int want_max) {
-    PyVal *best = NULL, *it = NULL, *item = NULL;
+    PyVal *best = NULL, *best_key = NULL, *it = NULL, *item = NULL;
     PyVal *key = py_kw_get(kwargs, "key");
+    PyVal *def = py_kw_get(kwargs, "default");
     int have = 0;
-    if (argc == 0) py_raise(PY_EXC_TYPE, "expected at least one argument");
-    if (argc == 1) { it = py_iter(args[0]); }
+    if (!argc) {
+        if (def) { py_retain(def); return def; }
+        py_raise(PY_EXC_TYPE, "expected at least one argument");
+        return py_none();
+    }
+    if (argc == 1) it = py_iter(args[0]);
     else {
         size_t i;
         for (i = 0; i < argc; i++) {
-            PyVal *k = key && key->type != PY_T_NONE ? py_call(key, &args[i], 1, NULL) : args[i];
-            if (!have || (want_max ? py_cmp(PY_CMP_GT, k, best) : py_cmp(PY_CMP_LT, k, best))) {
-                py_assign(&best, args[i]);
+            PyVal *v = args[i];
+            PyVal *k = key && key->type != PY_T_NONE ? py_call(key, &v, 1, NULL) : v;
+            if (!have || (want_max ? py_cmp(PY_CMP_GT, k, best_key)
+                                   : py_cmp(PY_CMP_LT, k, best_key))) {
+                py_assign(&best, v);
+                py_assign(&best_key, k);
                 have = 1;
             }
-            if (k != args[i]) py_release(k);
+            if (k != v) py_release(k);
         }
-        py_retain(best);
+        py_release(best_key);
         return best;
     }
     while (py_iter_next(it, &item)) {
         PyVal *k = key && key->type != PY_T_NONE ? py_call(key, &item, 1, NULL) : item;
-        if (!have || (want_max ? py_cmp(PY_CMP_GT, k, best) : py_cmp(PY_CMP_LT, k, best))) {
+        if (!have || (want_max ? py_cmp(PY_CMP_GT, k, best_key)
+                               : py_cmp(PY_CMP_LT, k, best_key))) {
             py_assign(&best, item);
+            py_assign(&best_key, k);
             have = 1;
         }
         if (k != item) py_release(k);
     }
     py_release(it);
     py_release(item);
-    if (!have) py_raise(PY_EXC_VALUE, "min()/max() arg is an empty sequence");
-    py_retain(best);
+    if (!have) {
+        py_release(best_key);
+        if (def) { py_retain(def); return def; }
+        py_raise(PY_EXC_VALUE, "min()/max() arg is an empty sequence");
+        return py_none();
+    }
+    py_release(best_key);
     return best;
 }
 PyVal *py_builtin_min(PyVal **args, size_t argc, PyVal *kwargs) { return minmax(args, argc, kwargs, 0); }
 PyVal *py_builtin_max(PyVal **args, size_t argc, PyVal *kwargs) { return minmax(args, argc, kwargs, 1); }
 
 PyVal *py_builtin_sum(PyVal **args, size_t argc, PyVal *kwargs) {
-    PyVal *acc = argc > 1 ? args[1] : py_int(0);
+    PyVal *start = py_kw_get(kwargs, "start");
+    PyVal *acc = start ? start : (argc > 1 ? args[1] : py_int(0));
     PyVal *it, *item = NULL;
+    if (argc < 1) { py_raise(PY_EXC_TYPE, "sum() takes at least one argument"); return py_none(); }
     py_retain(acc);
-    if (argc < 1) py_raise(PY_EXC_TYPE, "sum() takes at least one argument");
     it = py_iter(args[0]);
     while (py_iter_next(it, &item)) {
         PyVal *n = py_binop(PY_OP_ADD, acc, item);
@@ -2822,7 +2968,6 @@ PyVal *py_builtin_sum(PyVal **args, size_t argc, PyVal *kwargs) {
     }
     py_release(it);
     py_release(item);
-    (void)kwargs;
     return acc;
 }
 
@@ -2938,18 +3083,30 @@ PyVal *py_builtin_all(PyVal **args, size_t argc, PyVal *kwargs) {
 PyVal *py_builtin_chr(PyVal **args, size_t argc, PyVal *kwargs) {
     char buf[4];
     size_t n;
+    int64_t cp;
     (void)kwargs;
-    if (argc < 1) py_raise(PY_EXC_TYPE, "chr() takes one argument");
-    u8_encode((uint32_t)py_as_int(args[0]), buf, &n);
+    if (argc < 1) { py_raise(PY_EXC_TYPE, "chr() takes one argument"); return py_none(); }
+    cp = py_as_int(args[0]);
+    if (cp < 0 || cp > 0x10FFFF) {
+        py_raise(PY_EXC_VALUE, "chr() arg not in range(0x110000)");
+        return py_none();
+    }
+    u8_encode((uint32_t)cp, buf, &n);
     return py_strn(buf, n);
 }
 PyVal *py_builtin_ord(PyVal **args, size_t argc, PyVal *kwargs) {
     size_t adv;
     uint32_t cp;
     (void)kwargs;
-    if (argc < 1 || args[0]->type != PY_T_STR || args[0]->u.s.len == 0)
+    if (argc < 1 || args[0]->type != PY_T_STR || args[0]->u.s.len == 0) {
         py_raise(PY_EXC_TYPE, "ord() expected a character");
+        return py_none();
+    }
     cp = u8_decode(args[0]->u.s.data, args[0]->u.s.len, &adv);
+    if (adv != args[0]->u.s.len) {
+        py_raise(PY_EXC_TYPE, "ord() expected a character, but string of length > 1 found");
+        return py_none();
+    }
     return py_int((int64_t)cp);
 }
 
@@ -2973,7 +3130,12 @@ PyVal *py_builtin_pow(PyVal **args, size_t argc, PyVal *kwargs) {
     if (argc >= 3) {
         int64_t b = py_as_int(args[0]), e = py_as_int(args[1]), m = py_as_int(args[2]);
         int64_t r = 1;
+        if (m <= 0 || e < 0) {
+            py_raise(PY_EXC_VALUE, "pow() requires a non-negative exponent and positive modulus");
+            return py_none();
+        }
         b %= m;
+        if (b < 0) b += m;
         while (e > 0) {
             if (e & 1) r = (r * b) % m;
             e >>= 1;
@@ -3038,79 +3200,279 @@ PyVal *py_builtin_repr(PyVal **args, size_t argc, PyVal *kwargs) {
     return py_repr(arg_at(args, argc, 0));
 }
 
-PyVal *py_builtin_format(PyVal **args, size_t argc, PyVal *kwargs) {
-    PyVal *v, *spec;
-    int align = 0, fill = ' ', width = 0, prec = -1, zero = 0, alt = 0;
-    char type = 0;
-    const char *sp;
-    size_t i = 0, sl;
-    (void)kwargs;
-    if (argc < 1) py_raise(PY_EXC_TYPE, "format() takes at least one argument");
-    v = args[0];
-    if (argc < 2 || args[1]->type != PY_T_STR) return py_str_of(v);
-    spec = args[1];
-    sp = spec->u.s.data;
-    sl = spec->u.s.len;
-    if (sl == 0) return py_str_of(v);
-    if (sl >= 2 && (sp[1] == '<' || sp[1] == '>' || sp[1] == '^' || sp[1] == '=')) {
-        fill = sp[0];
-        align = sp[1];
-        i = 2;
-    } else if (sl >= 1 && (sp[0] == '<' || sp[0] == '>' || sp[0] == '^' || sp[0] == '=')) {
-        align = sp[0];
-        i = 1;
+/* ------------------------------------------------------- format protocol */
+typedef struct {
+    char fill[8];
+    size_t fill_len;
+    int align;
+    char sign;
+    int alt, zero, width, prec;
+    char group, type;
+} FmtSpec;
+
+static int fmt_is_align(uint32_t c) {
+    return c == '<' || c == '>' || c == '^' || c == '=';
+}
+
+static int fmt_parse(const char *sp, size_t sl, FmtSpec *f) {
+    size_t i = 0, p = 0, cand = 0, cand_len = 0;
+    memset(f, 0, sizeof(*f));
+    f->fill[0] = ' ';
+    f->fill_len = 1;
+    f->prec = -1;
+    while (p < sl) {
+        size_t adv = 1;
+        uint32_t cp = u8_decode(sp + p, sl - p, &adv);
+        if (fmt_is_align(cp)) {
+            if (cand_len && cand_len <= sizeof(f->fill)) {
+                memcpy(f->fill, sp + cand, cand_len);
+                f->fill_len = cand_len;
+            }
+            f->align = (int)cp;
+            i = p + adv;
+            break;
+        }
+        if (!cand_len) { cand = p; cand_len = adv; }
+        else break;
+        p += adv;
     }
-    if (i < sl && (sp[i] == '+' || sp[i] == '-' || sp[i] == ' ')) i++;
-    if (i < sl && sp[i] == '#') { alt = 1; i++; }
-    if (i < sl && sp[i] == '0') { zero = 1; i++; }
-    while (i < sl && isdigit((unsigned char)sp[i])) { width = width * 10 + (sp[i] - '0'); i++; }
+    if (!f->align) i = 0;
+    if (i < sl && (sp[i] == '+' || sp[i] == '-' || sp[i] == ' '))
+        f->sign = sp[i++];
+    if (i < sl && sp[i] == 'z') i++; /* Python 3.11 sign-aware zero option */
+    if (i < sl && sp[i] == '#') { f->alt = 1; i++; }
+    if (i < sl && sp[i] == '0') {
+        f->zero = 1;
+        if (!f->align || f->align == '=') {
+            f->align = '=';
+            f->fill[0] = '0';
+            f->fill_len = 1;
+        }
+        i++;
+    }
+    while (i < sl && isdigit((unsigned char)sp[i])) {
+        f->width = f->width * 10 + (sp[i] - '0');
+        i++;
+    }
+    if (i < sl && (sp[i] == ',' || sp[i] == '_')) f->group = sp[i++];
     if (i < sl && sp[i] == '.') {
-        i++; prec = 0;
-        while (i < sl && isdigit((unsigned char)sp[i])) { prec = prec * 10 + (sp[i] - '0'); i++; }
+        i++;
+        f->prec = 0;
+        while (i < sl && isdigit((unsigned char)sp[i])) {
+            f->prec = f->prec * 10 + (sp[i] - '0');
+            i++;
+        }
     }
-    if (i < sl) type = sp[i];
-    if (!type) type = (v->type == PY_T_FLOAT) ? 'g' : (v->type == PY_T_STR ? 's' : 'd');
-    if (type == 's' || v->type == PY_T_STR) {
-        PyVal *s = py_str_of(v);
-        PyVal *r;
-        size_t len = s->u.s.len, pad = width > (int)len ? (size_t)width - len : 0;
-        size_t left = align == '<' ? 0 : align == '^' ? pad / 2 : pad;
-        Buf b;
-        buf_init(&b);
-        for (i = 0; i < left; i++) buf_addc(&b, (char)fill);
-        buf_add(&b, s->u.s.data, s->u.s.len);
-        for (i = 0; i < pad - left; i++) buf_addc(&b, (char)fill);
-        py_release(s);
-        r = py_strn(b.data, b.len);
-        free(b.data);
-        return r;
+    if (i < sl) f->type = sp[i++];
+    if (f->width < 0) f->width = INT_MAX;
+    if (f->prec < -1) f->prec = -1;
+    if (i != sl) {
+        py_raise(PY_EXC_VALUE, "Invalid format specifier");
+        return 0;
+    }
+    return 1;
+}
+
+static void fmt_fill(Buf *b, const FmtSpec *f, size_t n) {
+    while (n > 0) {
+        buf_add(b, f->fill, f->fill_len);
+        n--;
+    }
+}
+
+static void fmt_group(Buf *b, const char *digits, size_t n, char sep) {
+    size_t first = n % 3 ? n % 3 : 3, i;
+    if (!sep || !n) { buf_add(b, digits, n); return; }
+    for (i = 0; i < n; i++) {
+        if (i && (i == first || (i - first) % 3 == 0)) buf_addc(b, sep);
+        buf_addc(b, digits[i]);
+    }
+}
+
+static void fmt_pad(Buf *b, const char *text, size_t len, const FmtSpec *f) {
+    size_t width = f->width > 0 ? (size_t)f->width : 0;
+    size_t used = u8_len(text, len);
+    size_t pad = width > used ? width - used : 0;
+    size_t left = f->align == '<' ? 0 : f->align == '^' ? pad / 2 : pad;
+    fmt_fill(b, f, left);
+    buf_add(b, text, len);
+    fmt_fill(b, f, pad - left);
+}
+
+static void fmt_int_body(Buf *b, int64_t value, const FmtSpec *f) {
+    uint64_t u = value < 0 ? (uint64_t)(-(value + 1)) + 1 : (uint64_t)value;
+    char raw[96];
+    const char *digits = "0123456789abcdef";
+    size_t n = 0;
+    char type = f->type;
+    if (type == 'c') {
+        char enc[8];
+        size_t elen = 0;
+        u8_encode((uint32_t)u, enc, &elen);
+        buf_add(b, enc, elen);
+        return;
+    }
+    if (!type || type == 'd' || type == 'i' || type == 'n') {
+        int written = snprintf(raw, sizeof(raw), "%" PRIu64, u);
+        n = written > 0 ? (size_t)written : 0;
+        if (n >= sizeof(raw)) n = sizeof(raw) - 1;
+    }
+    else {
+        unsigned base = type == 'b' ? 2 : type == 'o' ? 8 : 16;
+        uint64_t v = u;
+        do {
+            raw[n++] = digits[v % base];
+            v /= base;
+        } while (v && n < sizeof(raw) - 1);
+        {
+            char rev[96];
+            size_t i;
+            for (i = 0; i < n; i++) rev[i] = raw[n - 1 - i];
+            memcpy(raw, rev, n);
+        }
+        if (f->alt) {
+            if (type == 'b') buf_adds(b, "0b");
+            else if (type == 'o') buf_adds(b, "0o");
+            else if (type == 'x') buf_adds(b, "0x");
+            else if (type == 'X') buf_adds(b, "0X");
+        }
+    }
+    if (type == 'X') {
+        size_t i;
+        for (i = 0; i < n; i++)
+            if (raw[i] >= 'a' && raw[i] <= 'f') raw[i] = (char)(raw[i] - 32);
+    }
+    fmt_group(b, raw, n, f->group);
+}
+
+static void fmt_float_body(Buf *b, double value, const FmtSpec *f) {
+    char raw[512], body[512];
+    const char *fmt;
+    int prec = f->prec >= 0 ? f->prec : 6;
+    double x = fabs(value);
+    size_t n, i = 0, digits = 0;
+    if (f->type == '%') x *= 100.0;
+    switch (f->type) {
+    case 'e': fmt = "%.*e"; break;
+    case 'E': fmt = "%.*E"; break;
+    case 'F': case 'f': case '%': fmt = "%.*f"; break;
+    case 'G': fmt = "%.*G"; break;
+    case 'g': default: fmt = "%.*g"; break;
     }
     {
-        char fmt[64], out[256];
-        int n;
-        size_t fl = 0;
-        if (align && fill != ' ') { fmt[fl++] = '%'; fmt[fl++] = '-'; }
-        else fmt[fl++] = '%';
-        if (alt) fmt[fl++] = '#';
-        if (zero) fmt[fl++] = '0';
-        if (width > 0) fl += (size_t)snprintf(fmt + fl, sizeof(fmt) - fl, "%d", width);
-        if (prec >= 0) fl += (size_t)snprintf(fmt + fl, sizeof(fmt) - fl, ".%d", prec);
-        if (type == 'd' || type == 'i') fmt[fl++] = 'l', fmt[fl++] = 'l', fmt[fl++] = 'd';
-        else if (type == 'x' || type == 'X' || type == 'o') {
-            fmt[fl++] = 'l'; fmt[fl++] = 'l';
-            if (type == 'X') alt = 0;
-            fmt[fl++] = type;
-        }
-        else fmt[fl++] = type;
-        fmt[fl] = 0;
-        if (type == 'd' || type == 'i' || type == 'x' || type == 'X' || type == 'o')
-            n = snprintf(out, sizeof(out), fmt, (long long)py_as_int(v));
-        else
-            n = snprintf(out, sizeof(out), fmt, py_as_float(v));
-        if (n < 0) n = 0;
-        if ((size_t)n >= sizeof(out)) n = (int)sizeof(out) - 1;
-        return py_strn(out, (size_t)n);
+        int written = snprintf(raw, sizeof(raw), fmt, prec, x);
+        n = written > 0 ? (size_t)written : 0;
     }
+    if (n >= sizeof(raw)) n = sizeof(raw) - 1;
+    while (i < n && isdigit((unsigned char)raw[i])) { body[i] = raw[i]; i++; }
+    digits = i;
+    if (i < n && raw[i] == '.') {
+        body[i++] = '.';
+        while (i < n && isdigit((unsigned char)raw[i])) {
+            body[i] = raw[i];
+            i++;
+        }
+    }
+    fmt_group(b, body, digits, f->group);
+    if (digits < i) buf_add(b, body + digits, i - digits);
+    if (i < n) buf_add(b, raw + i, n - i);
+    if (f->type == '%') buf_addc(b, '%');
+}
+
+PyVal *py_builtin_format(PyVal **args, size_t argc, PyVal *kwargs) {
+    PyVal *v, *s = NULL;
+    FmtSpec f;
+    const char *sp;
+    size_t sl;
+    Buf body, full;
+    char sign = 0;
+    int is_int, is_str;
+    (void)kwargs;
+    if (argc < 1) { py_raise(PY_EXC_TYPE, "format() takes at least one argument"); return py_none(); }
+    v = args[0];
+    if (argc < 2 || !v) return py_str_of(v);
+    if (args[1]->type != PY_T_STR) {
+        py_raise(PY_EXC_TYPE, "format spec must be a string");
+        return py_none();
+    }
+    s = args[1];
+    sp = s->u.s.data;
+    sl = s->u.s.len;
+    if (!sl) return py_str_of(v);
+    if (!fmt_parse(sp, sl, &f)) return py_none();
+    is_str = v->type == PY_T_STR;
+    is_int = v->type == PY_T_INT || v->type == PY_T_BOOL;
+    if (!f.align) f.align = is_str ? '<' : '>';
+    buf_init(&body);
+    if (is_str) {
+        PyVal *sv = py_str_of(v);
+        size_t len = sv->u.s.len;
+        if (f.type && f.type != 's') {
+            py_release(sv);
+            free(body.data);
+            py_raise(PY_EXC_VALUE, "Invalid format specifier for string");
+            return py_none();
+        }
+        if (f.align == '=') {
+            py_release(sv);
+            free(body.data);
+            py_raise(PY_EXC_VALUE, "'=' alignment is not allowed for strings");
+            return py_none();
+        }
+        if (f.prec >= 0) len = u8_offset(sv->u.s.data, len, (size_t)f.prec);
+        buf_add(&body, sv->u.s.data, len);
+        py_release(sv);
+        buf_init(&full);
+        fmt_pad(&full, body.data ? body.data : "", body.len, &f);
+        free(body.data);
+        s = py_strn(full.data ? full.data : "", full.len);
+        free(full.data);
+        return s;
+    }
+    if (f.type && strchr("bcdoxXn", f.type) && !is_int) {
+        free(body.data);
+        py_raise(PY_EXC_VALUE, "integer format requires an integer");
+        return py_none();
+    }
+    if (f.type == 's') {
+        free(body.data);
+        py_raise(PY_EXC_VALUE, "string format requires a string");
+        return py_none();
+    }
+    if (is_int) {
+        int64_t iv = py_as_int(v);
+        if (iv < 0) sign = '-';
+        else if (f.sign == '+') sign = '+';
+        else if (f.sign == ' ') sign = ' ';
+        fmt_int_body(&body, iv, &f);
+    } else {
+        double dv = py_as_float(v);
+        if (dv < 0 || (dv == 0.0 && signbit(dv))) sign = '-';
+        else if (f.sign == '+') sign = '+';
+        else if (f.sign == ' ') sign = ' ';
+        fmt_float_body(&body, dv, &f);
+    }
+    buf_init(&full);
+    if (f.align == '=' && sign) {
+        size_t width = f.width > 0 ? (size_t)f.width : 0;
+        size_t used = u8_len(body.data ? body.data : "", body.len) + 1;
+        size_t pad = width > used ? width - used : 0;
+        buf_addc(&full, sign);
+        fmt_fill(&full, &f, pad);
+        buf_add(&full, body.data ? body.data : "", body.len);
+    } else {
+        Buf signed_body;
+        buf_init(&signed_body);
+        if (sign) buf_addc(&signed_body, sign);
+        buf_add(&signed_body, body.data ? body.data : "", body.len);
+        fmt_pad(&full, signed_body.data ? signed_body.data : "",
+                signed_body.len, &f);
+        free(signed_body.data);
+    }
+    free(body.data);
+    s = py_strn(full.data ? full.data : "", full.len);
+    free(full.data);
+    return s;
 }
 
 PyVal *py_builtin_id(PyVal **args, size_t argc, PyVal *kwargs) {
@@ -3122,29 +3484,181 @@ PyVal *py_builtin_hash(PyVal **args, size_t argc, PyVal *kwargs) {
     return py_int((int64_t)py_hash(arg_at(args, argc, 0)));
 }
 
+static int exc_kind_for_name(const char *name) {
+    static const struct { const char *name; int kind; } names[] = {
+        {"BaseException", PY_EXC_BASE}, {"SystemExit", PY_EXC_BASE},
+        {"KeyboardInterrupt", PY_EXC_BASE}, {"GeneratorExit", PY_EXC_BASE},
+        {"BaseExceptionGroup", PY_EXC_BASE},
+        {"Exception", PY_EXC_EXCEPTION}, {"ExceptionGroup", PY_EXC_EXCEPTION},
+        {"Warning", PY_EXC_EXCEPTION}, {"BytesWarning", PY_EXC_EXCEPTION},
+        {"DeprecationWarning", PY_EXC_EXCEPTION},
+        {"EncodingWarning", PY_EXC_EXCEPTION}, {"FutureWarning", PY_EXC_EXCEPTION},
+        {"ImportWarning", PY_EXC_EXCEPTION},
+        {"PendingDeprecationWarning", PY_EXC_EXCEPTION},
+        {"ResourceWarning", PY_EXC_EXCEPTION}, {"RuntimeWarning", PY_EXC_EXCEPTION},
+        {"SyntaxWarning", PY_EXC_EXCEPTION}, {"UnicodeWarning", PY_EXC_EXCEPTION},
+        {"UserWarning", PY_EXC_EXCEPTION},
+        {"ArithmeticError", PY_EXC_ARITHMETIC},
+        {"FloatingPointError", PY_EXC_ARITHMETIC},
+        {"AssertionError", PY_EXC_ASSERTION}, {"AttributeError", PY_EXC_ATTRIBUTE},
+        {"IndexError", PY_EXC_INDEX}, {"LookupError", PY_EXC_INDEX},
+        {"KeyError", PY_EXC_KEY}, {"NameError", PY_EXC_NAME},
+        {"UnboundLocalError", PY_EXC_NAME},
+        {"OSError", PY_EXC_OS}, {"IOError", PY_EXC_OS},
+        {"EnvironmentError", PY_EXC_OS}, {"WindowsError", PY_EXC_OS},
+        {"BlockingIOError", PY_EXC_OS}, {"BrokenPipeError", PY_EXC_OS},
+        {"ChildProcessError", PY_EXC_OS}, {"ConnectionError", PY_EXC_OS},
+        {"ConnectionAbortedError", PY_EXC_OS},
+        {"ConnectionRefusedError", PY_EXC_OS}, {"ConnectionResetError", PY_EXC_OS},
+        {"InterruptedError", PY_EXC_OS}, {"PermissionError", PY_EXC_OS},
+        {"ProcessLookupError", PY_EXC_OS}, {"TimeoutError", PY_EXC_OS},
+        {"FileNotFoundError", PY_EXC_FILE}, {"FileExistsError", PY_EXC_FILE},
+        {"IsADirectoryError", PY_EXC_FILE}, {"NotADirectoryError", PY_EXC_FILE},
+        {"RuntimeError", PY_EXC_RUNTIME}, {"TclError", PY_EXC_RUNTIME},
+        {"tkinter.TclError", PY_EXC_RUNTIME}, {"SystemError", PY_EXC_RUNTIME},
+        {"RecursionError", PY_EXC_RUNTIME}, {"ReferenceError", PY_EXC_RUNTIME},
+        {"BufferError", PY_EXC_RUNTIME},
+        {"StopIteration", PY_EXC_STOP_ITERATION},
+        {"StopAsyncIteration", PY_EXC_STOP_ITERATION},
+        {"TypeError", PY_EXC_TYPE}, {"ValueError", PY_EXC_VALUE},
+        {"SyntaxError", PY_EXC_VALUE}, {"IndentationError", PY_EXC_VALUE},
+        {"TabError", PY_EXC_VALUE}, {"UnicodeError", PY_EXC_VALUE},
+        {"UnicodeDecodeError", PY_EXC_VALUE}, {"UnicodeEncodeError", PY_EXC_VALUE},
+        {"UnicodeTranslateError", PY_EXC_VALUE},
+        {"ZeroDivisionError", PY_EXC_ZERO_DIVISION},
+        {"ImportError", PY_EXC_IMPORT}, {"ModuleNotFoundError", PY_EXC_IMPORT},
+        {"NotImplementedError", PY_EXC_UNSUPPORTED}, {"EOFError", PY_EXC_EOF},
+        {"OverflowError", PY_EXC_OVERFLOW}, {"MemoryError", PY_EXC_MEMORY},
+        {NULL, -1}
+    };
+    size_t i;
+    if (!name) return -1;
+    for (i = 0; names[i].name; i++)
+        if (!strcmp(name, names[i].name)) return names[i].kind;
+    return -1;
+}
+
+static const char *class_name_of(PyVal *cls) {
+    if (!cls) return NULL;
+    if (cls->type == PY_T_CLASS && cls->u.klass.name)
+        return cls->u.klass.name->u.s.data;
+    if (cls->type == PY_T_STR) return cls->u.s.data;
+    if (cls->type == PY_T_EXC && cls->u.exc.cls)
+        return class_name_of(cls->u.exc.cls);
+    if (cls->type == PY_T_FUNC) return cls->u.func.name;
+    return NULL;
+}
+
+static PyVal *class_first_base(PyVal *cls) {
+    PyVal *bases;
+    if (!cls || cls->type != PY_T_CLASS) return NULL;
+    bases = map_get_cstr(cls->u.klass.dict, "__bases__");
+    if (!bases || bases->type != PY_T_LIST || !bases->u.seq.len) return NULL;
+    return bases->u.seq.items[0];
+}
+
+static PyVal *class_attr_rec(PyVal *cls, const char *name, int depth) {
+    PyVal *r, *bases;
+    size_t i;
+    if (!cls || cls->type != PY_T_CLASS || depth > 64) return NULL;
+    r = map_get_cstr(cls->u.klass.dict, name);
+    if (r) return r;
+    bases = map_get_cstr(cls->u.klass.dict, "__bases__");
+    if (!bases || bases->type != PY_T_LIST) return NULL;
+    for (i = 0; i < bases->u.seq.len; i++) {
+        r = class_attr_rec(bases->u.seq.items[i], name, depth + 1);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+static PyVal *class_attr(PyVal *cls, const char *name) {
+    return class_attr_rec(cls, name, 0);
+}
+
+static int class_chain_has(PyVal *cls, PyVal *target, const char *name, int depth) {
+    PyVal *bases;
+    size_t i;
+    if (!cls || depth > 64) return 0;
+    if (target && cls == target) return 1;
+    if (name) {
+        const char *n = class_name_of(cls);
+        if (n && !strcmp(n, name)) return 1;
+    }
+    if (cls->type != PY_T_CLASS) return 0;
+    bases = map_get_cstr(cls->u.klass.dict, "__bases__");
+    if (!bases || bases->type != PY_T_LIST) return 0;
+    for (i = 0; i < bases->u.seq.len; i++)
+        if (class_chain_has(bases->u.seq.items[i], target, name, depth + 1)) return 1;
+    return 0;
+}
+
+static int class_kind(PyVal *cls) {
+    PyVal *v;
+    if (!cls) return -1;
+    if (cls->type == PY_T_STR) return exc_kind_for_name(cls->u.s.data);
+    if (cls->type != PY_T_CLASS) return -1;
+    v = class_attr(cls, "__exc_kind__");
+    if (v && v->type == PY_T_INT) return (int)v->u.i;
+    return -1;
+}
+
+int py_class_is_subclass(PyVal *cls, PyVal *base) {
+    const char *want;
+    int want_kind, got_kind;
+    if (!cls || !base) return 0;
+    if (cls->type == PY_T_EXC) cls = cls->u.exc.cls;
+    if (base->type == PY_T_EXC) base = base->u.exc.cls;
+    if (!cls || !base) return 0;
+    if (cls == base) return 1;
+    want = class_name_of(base);
+    if (want && !strcmp(want, "object")) return 1;
+    {
+        const char *got_name = class_name_of(cls);
+        if (got_name && want && !strcmp(got_name, "bool") && !strcmp(want, "int")) return 1;
+    }
+    if (class_chain_has(cls, base, want, 0)) return 1;
+    want_kind = (base->type == PY_T_STR) ? exc_kind_for_name(base->u.s.data)
+                                         : class_kind(base);
+    got_kind = class_kind(cls);
+    if (want_kind < 0 || got_kind < 0) return 0;
+    if (want_kind == PY_EXC_BASE) return 1;
+    if (want_kind == PY_EXC_EXCEPTION) return got_kind != PY_EXC_BASE;
+    if (want_kind == got_kind) return 1;
+    if (want_kind == PY_EXC_OS && got_kind == PY_EXC_FILE) return 1;
+    if (want_kind == PY_EXC_ARITHMETIC &&
+        (got_kind == PY_EXC_ZERO_DIVISION || got_kind == PY_EXC_OVERFLOW)) return 1;
+    return 0;
+}
+
 static int class_matches(PyVal *obj, PyVal *cls) {
     const char *want = NULL;
+    if (!obj || !cls) return 0;
+    if (cls->type == PY_T_TUPLE) {
+        size_t i;
+        for (i = 0; i < cls->u.seq.len; i++)
+            if (class_matches(obj, cls->u.seq.items[i])) return 1;
+        return 0;
+    }
+    if (obj->type == PY_T_EXC && obj->u.exc.cls &&
+        py_class_is_subclass(obj->u.exc.cls, cls)) return 1;
+    if (obj->type == PY_T_DICT) {
+        PyVal *k = map_get_cstr(obj, "__class__");
+        if (k && py_class_is_subclass(k, cls)) return 1;
+    }
     if (cls->type == PY_T_CLASS) {
-        PyVal *k;
-        if (obj->type == PY_T_DICT) {
-            k = map_get_cstr(obj, "__class__");
-            if (k == cls) return 1;
-        }
         want = cls->u.klass.name ? cls->u.klass.name->u.s.data : "object";
     } else if (cls->type == PY_T_FUNC) {
         want = cls->u.func.name;
     } else if (cls->type == PY_T_STR) {
         want = cls->u.s.data;
-    } else if (cls->type == PY_T_TUPLE) {
-        size_t i;
-        for (i = 0; i < cls->u.seq.len; i++)
-            if (class_matches(obj, cls->u.seq.items[i])) return 1;
-        return 0;
     } else {
         return 0;
     }
     if (!want) return 0;
     if (!strcmp(want, "object")) return 1;
+    if (obj->type == PY_T_EXC && py_exc_matches_name(obj, want)) return 1;
+    if (obj->type == PY_T_CLASS && py_class_is_subclass(obj, cls)) return 1;
     {
         const char *got = type_name(obj);
         if (!strcmp(want, got)) return 1;
@@ -3153,7 +3667,6 @@ static int class_matches(PyVal *obj, PyVal *cls) {
     }
     return 0;
 }
-
 PyVal *py_builtin_isinstance(PyVal **args, size_t argc, PyVal *kwargs) {
     (void)kwargs;
     if (argc < 2) py_raise(PY_EXC_TYPE, "isinstance() takes two arguments");
@@ -3173,8 +3686,29 @@ PyVal *py_builtin_open(PyVal **args, size_t argc, PyVal *kwargs) {
     return py_open_file(py_cstr(args[0]), mode);
 }
 
+static PyVal *iter_next_callable(PyIter *it) {
+    PyVal *r = py_call(it->src, NULL, 0, NULL);
+    if (it->extra && py_cmp(PY_CMP_EQ, r, it->extra)) {
+        py_release(r);
+        return NULL;
+    }
+    return r;
+}
+
 PyVal *py_builtin_iter(PyVal **args, size_t argc, PyVal *kwargs) {
     (void)kwargs;
+    if (argc > 1) {
+        PyVal *v = val_new(PY_T_ITER);
+        PyIter *it = (PyIter *)xmalloc(sizeof(PyIter));
+        memset(it, 0, sizeof(*it));
+        it->src = args[0];
+        py_retain(it->src);
+        it->extra = args[1];
+        py_retain(it->extra);
+        it->next = iter_next_callable;
+        v->u.iter.it = it;
+        return v;
+    }
     return py_iter(arg_at(args, argc, 0));
 }
 PyVal *py_builtin_next(PyVal **args, size_t argc, PyVal *kwargs) {
@@ -3240,9 +3774,24 @@ PyVal *py_builtin_filter(PyVal **args, size_t argc, PyVal *kwargs) {
 }
 
 PyVal *py_builtin_getattr(PyVal **args, size_t argc, PyVal *kwargs) {
+    PyJmp *h;
+    PyVal * volatile result = NULL;
+    int failed = 0;
     (void)kwargs;
-    if (argc < 2) py_raise(PY_EXC_TYPE, "getattr() takes two arguments");
-    return py_getattr(args[0], py_cstr(args[1]));
+    if (argc < 2) { py_raise(PY_EXC_TYPE, "getattr() takes two arguments"); return py_none(); }
+    if (argc < 3) return py_getattr(args[0], py_cstr(args[1]));
+    h = py_push_handler();
+    if (setjmp(h->buf) == 0) result = py_getattr(args[0], py_cstr(args[1]));
+    else {
+        failed = 1;
+        py_exc_clear();
+        result = args[2];
+    }
+    py_pop_handler(h);
+    if (!failed) return result;      /* py_getattr returns a new reference */
+    if (result) { py_retain(result); return result; }
+    py_raise(PY_EXC_ATTRIBUTE, "attribute not found");
+    return py_none();
 }
 PyVal *py_builtin_setattr(PyVal **args, size_t argc, PyVal *kwargs) {
     (void)kwargs;
@@ -3267,10 +3816,14 @@ PyVal *py_builtin_hasattr(PyVal **args, size_t argc, PyVal *kwargs) {
     return py_bool(ok);
 }
 PyVal *py_builtin_callable(PyVal **args, size_t argc, PyVal *kwargs) {
+    PyVal *v;
     (void)kwargs;
     if (argc < 1) return py_bool(0);
-    return py_bool(args[0]->type == PY_T_FUNC || args[0]->type == PY_T_BOUND ||
-                   args[0]->type == PY_T_CLASS);
+    v = args[0];
+    if (v->type == PY_T_FUNC || v->type == PY_T_BOUND || v->type == PY_T_CLASS ||
+        v->type == PY_T_MODFUNC || v->type == PY_T_GUIMETHOD) return py_bool(1);
+    if (v->type == PY_T_DICT && map_get_cstr(v, "__call__")) return py_bool(1);
+    return py_bool(0);
 }
 /* -------------------------------------------------------------- exceptions */
 const char *py_exc_name(int kind) {
@@ -3299,6 +3852,45 @@ const char *py_exc_name(int kind) {
     }
 }
 
+static const char *exc_type_name(PyVal *exc) {
+    const char *n;
+    if (!exc || exc->type != PY_T_EXC) return "Exception";
+    n = class_name_of(exc->u.exc.cls);
+    return n ? n : py_exc_name(exc->u.exc.kind);
+}
+
+PyVal *py_exc_class(const char *name) {
+    static PyVal *cache[PY_EXC_FILE + 1];
+    int kind = exc_kind_for_name(name);
+    const char *canonical;
+    PyVal *d, *c;
+    if (kind < 0) return NULL;
+    if (cache[kind]) { py_retain(cache[kind]); return cache[kind]; }
+    canonical = py_exc_name(kind);
+    d = py_dict_new();
+    map_put_cstr(d, "__exc_kind__", py_int(kind));
+    map_put_cstr(d, "__name__", py_str(canonical));
+    map_put_cstr(d, "__bases__", py_list_new());
+    c = py_class(d, canonical);
+    py_release(d);
+    cache[kind] = c;
+    py_retain(c);
+    return c;
+}
+
+int py_exc_matches_class(PyVal *exc, PyVal *cls) {
+    if (!exc || exc->type != PY_T_EXC || !cls) return 0;
+    if (exc->u.exc.cls) return py_class_is_subclass(exc->u.exc.cls, cls);
+    {
+        const char *n = class_name_of(cls);
+        int want = cls->type == PY_T_STR ? exc_kind_for_name(cls->u.s.data)
+                                         : class_kind(cls);
+        if (n && !strcmp(n, py_exc_name(exc->u.exc.kind))) return 1;
+        if (want >= 0) return py_exc_matches(exc, want);
+    }
+    return 0;
+}
+
 int py_exc_matches(PyVal *exc, int exctype) {
     if (!exc || exc->type != PY_T_EXC) return 0;
     if (exctype == PY_EXC_BASE || exctype == PY_EXC_EXCEPTION) return 1;
@@ -3313,6 +3905,7 @@ int py_exc_matches(PyVal *exc, int exctype) {
 int py_exc_matches_name(PyVal *exc, const char *name) {
     if (!exc || exc->type != PY_T_EXC) return 0;
     if (!strcmp(name, "BaseException") || !strcmp(name, "Exception")) return 1;
+    if (class_chain_has(exc->u.exc.cls, NULL, name, 0)) return 1;
     if (!strcmp(name, py_exc_name(exc->u.exc.kind))) return 1;
     if (!strcmp(name, "OSError") && exc->u.exc.kind == PY_EXC_FILE) return 1;
     if (!strcmp(name, "ArithmeticError") &&
@@ -3329,14 +3922,59 @@ PyVal *py_make_exc(int exctype, const char *msg) {
     v->u.exc.kind = exctype;
     v->u.exc.msg = (char *)xmalloc(n);
     memcpy(v->u.exc.msg, m, n);
+    v->u.exc.cls = NULL;
+    v->u.exc.args = NULL;
+    v->u.exc.attrs = NULL;
     return v;
 }
 
 PyVal *py_make_exc_val(int exctype, PyVal *msg) {
     PyVal *s = py_str_of(msg);
     PyVal *v = py_make_exc(exctype, s ? s->u.s.data : "");
+    PyVal *a[1];
+    a[0] = s;
+    v->u.exc.args = py_tuple_from(a, 1);
     py_release(s);
     return v;
+}
+
+/* Build an exception from a class object or from an instance created by a
+   transpiled class.  A new reference is always returned. */
+PyVal *py_exc_from_value(PyVal *v) {
+    PyVal *cls = NULL, *args = NULL, *attrs = NULL, *s, *e;
+    int kind;
+    if (!v) return NULL;
+    if (v->type == PY_T_EXC) { py_retain(v); return v; }
+    if (v->type == PY_T_CLASS) {
+        cls = v;
+    } else if (v->type == PY_T_DICT) {
+        cls = map_get_cstr(v, "__class__");
+        args = map_get_cstr(v, "__args__");
+        attrs = v;
+        if (!cls || cls->type != PY_T_CLASS) return NULL;
+    } else {
+        return NULL;
+    }
+    kind = class_kind(cls);
+    if (kind < 0) return NULL;
+    if (args && args->type != PY_T_TUPLE) args = NULL;
+    if (args && args->u.seq.len) s = py_str_of(args->u.seq.items[0]);
+    else s = py_str("");
+    e = py_make_exc(kind, py_cstr(s));
+    e->u.exc.cls = cls;
+    py_retain(cls);
+    if (args) {
+        e->u.exc.args = args;
+        py_retain(args);
+    } else {
+        e->u.exc.args = py_tuple_from(NULL, 0);
+    }
+    if (attrs) {
+        e->u.exc.attrs = attrs;
+        py_retain(attrs);
+    }
+    py_release(s);
+    return e;
 }
 
 void py_print_exc(PyVal *exc) {
@@ -3345,17 +3983,21 @@ void py_print_exc(PyVal *exc) {
         return;
     }
     fprintf(stderr, "Traceback (most recent call last):\n%s: %s\n",
-            py_exc_name(exc->u.exc.kind), exc->u.exc.msg);
+            exc_type_name(exc), exc->u.exc.msg);
     fflush(stderr);
 }
 
 void py_raise_val(PyVal *exc) {
-    if (!exc) exc = py_make_exc(PY_EXC_RUNTIME, "no active exception");
-    py_retain(exc);
+    PyVal *e = py_exc_from_value(exc);
+    if (!e) {
+        if (!exc) exc = py_make_exc(PY_EXC_RUNTIME, "no active exception");
+        e = exc;
+        py_retain(e);
+    }
     py_release(g_exc);
-    g_exc = exc;
+    g_exc = e;
     if (!g_handler) {
-        py_print_exc(exc);
+        py_print_exc(e);
         exit(1);
     }
     longjmp(g_handler->buf, 1);
@@ -3663,17 +4305,37 @@ static PyVal *functools_call(const char *name, PyVal **args, size_t argc) {
     return NULL;
 }
 
+static const char *canonical_module_name(const char *module) {
+    const char *m = py311_canonical_module(module);
+    if (!m) m = module ? module : "";
+    if (streq(m, "ntpath") || streq(m, "genericpath")) return "os.path";
+    if (streq(m, "collections.abc")) return "collections";
+    if (streq(m, "urllib.parse")) return "urllib";
+    if (streq(m, "urllib.error")) return "urllib.request";
+    return m;
+}
+
 int py_module_known(const char *module) {
-    return streq(module, "math") || streq(module, "random") || streq(module, "time") ||
-           streq(module, "sys") || streq(module, "os") || streq(module, "os.path") ||
-           streq(module, "tkinter") || streq(module, "tkinter.ttk") ||
-           streq(module, "tkinter.messagebox") || streq(module, "tkinter.constants") ||
-           streq(module, "string") || streq(module, "platform") ||
-           streq(module, "functools") || streq(module, "itertools") ||
-           py_stdlib_module_known(module);
+    const char *m = canonical_module_name(module);
+    return py311_is_stdlib_module(m) ||
+           streq(m, "math") || streq(m, "random") || streq(m, "time") ||
+           streq(m, "sys") || streq(m, "os") || streq(m, "os.path") ||
+           streq(m, "posixpath") ||
+           streq(m, "tkinter") || streq(m, "tkinter.ttk") ||
+           streq(m, "tkinter.messagebox") || streq(m, "tkinter.constants") ||
+           streq(m, "string") || streq(m, "platform") ||
+           streq(m, "functools") || streq(m, "itertools") ||
+           py_stdlib_module_known(m) || py_extra_module_known(m);
 }
 
 PyVal *py_module_get(const char *module, const char *name) {
+    module = canonical_module_name(module);
+    if (streq(module, "builtins") || streq(module, "__builtin__"))
+        return py_builtin_lookup(name);
+    {
+        PyVal *full311 = py311_module_const(module, name);
+        if (full311) return full311;
+    }
     if (streq(module, "math")) {
         if (streq(name, "pi")) return py_float(3.14159265358979323846);
         if (streq(name, "e")) return py_float(2.71828182845904523536);
@@ -3692,6 +4354,12 @@ PyVal *py_module_get(const char *module, const char *name) {
         if (streq(name, "sep")) return py_str("\\");
         if (streq(name, "linesep")) return py_str("\r\n");
         if (streq(name, "name")) return py_str("nt");
+    }
+    if (streq(module, "posixpath")) {
+        if (streq(name, "sep")) return py_str("/");
+        if (streq(name, "curdir")) return py_str(".");
+        if (streq(name, "pardir")) return py_str("..");
+        if (streq(name, "linesep")) return py_str("\n");
     }
     if (streq(module, "string")) {
         if (streq(name, "ascii_lowercase")) return py_str("abcdefghijklmnopqrstuvwxyz");
@@ -3734,6 +4402,10 @@ PyVal *py_module_get(const char *module, const char *name) {
         PyVal *extra = py_stdlib_const(module, name);
         if (extra) return extra;
     }
+    {
+        PyVal *extra = py_extra_const(module, name);
+        if (extra) return extra;
+    }
     return NULL;
 }
 
@@ -3742,6 +4414,7 @@ PyVal *py_module_attr(const char *module, const char *name) {
     PyVal *m;
     char *md, *nd;
     if (v) return v;
+    module = canonical_module_name(module);
     m = val_new(PY_T_MODFUNC);
     {
         const char *ms = module ? module : "";
@@ -4030,10 +4703,134 @@ static PyVal *os_call(const char *name, PyVal **args, size_t argc) {
     return NULL;
 }
 
+/* POSIX path flavour: unlike os.path/ntpath this always uses '/' separators. */
+static PyVal *posixpath_norm(PyVal *path) {
+    const char *p = py_cstr(path);
+    Buf b;
+    size_t i = 0;
+    int absolute = *p == '/';
+    buf_init(&b);
+    if (absolute) buf_addc(&b, '/');
+    while (p[i]) {
+        const char *seg;
+        size_t n;
+        while (p[i] == '/') i++;
+        if (!p[i]) break;
+        seg = p + i;
+        while (p[i] && p[i] != '/') i++;
+        n = (size_t)(p + i - seg);
+        if (n == 1 && seg[0] == '.') continue;
+        if (n == 2 && seg[0] == '.' && seg[1] == '.') {
+            size_t len = b.len;
+            if (len > (size_t)absolute) {
+                if (b.data[len - 1] == '/') len--;
+                while (len > (size_t)absolute && b.data[len - 1] != '/') len--;
+                b.len = len;
+                if (b.data) b.data[b.len] = 0;
+            }
+            continue;
+        }
+        if (b.len && b.data[b.len - 1] != '/') buf_addc(&b, '/');
+        buf_add(&b, seg, n);
+    }
+    if (!b.len) buf_addc(&b, '.');
+    {
+        PyVal *r = py_strn(b.data ? b.data : "", b.len);
+        free(b.data);
+        return r;
+    }
+}
+
+static PyVal *posixpath_call(const char *name, PyVal **args, size_t argc) {
+    const char *p = argc ? py_cstr(args[0]) : "";
+    if (!argc) return py_str("");
+    const char *slash = strrchr(p, '/');
+    if (streq(name, "join") || streq(name, "path_join")) {
+        Buf b;
+        size_t i;
+        buf_init(&b);
+        for (i = 0; i < argc; i++) {
+            const char *part = py_cstr(args[i]);
+            if (!*part) continue;
+            if (*part == '/') { b.len = 0; if (b.data) b.data[0] = 0; }
+            else if (b.len && b.data[b.len - 1] != '/') buf_addc(&b, '/');
+            buf_adds(&b, part);
+        }
+        {
+            PyVal *r = py_strn(b.data ? b.data : "", b.len);
+            free(b.data);
+            return r;
+        }
+    }
+    if (streq(name, "basename") || streq(name, "path_basename"))
+        return py_str(slash ? slash + 1 : p);
+    if (streq(name, "dirname") || streq(name, "path_dirname")) {
+        if (!slash) return py_str("");
+        if (slash == p) return py_str("/");
+        return py_strn(p, (size_t)(slash - p));
+    }
+    if (streq(name, "split") || streq(name, "path_split")) {
+        PyVal *v[2];
+        PyVal *r;
+        if (!slash) { v[0] = py_str(""); v[1] = py_str(p); }
+        else if (slash == p) { v[0] = py_str("/"); v[1] = py_str(""); }
+        else {
+            v[0] = py_strn(p, (size_t)(slash - p));
+            v[1] = py_str(slash + 1);
+        }
+        r = py_tuple_from(v, 2);
+        py_release(v[0]); py_release(v[1]);
+        return r;
+    }
+    if (streq(name, "splitext") || streq(name, "path_splitext")) {
+        const char *base = slash ? slash + 1 : p;
+        const char *dot = strrchr(base, '.');
+        PyVal *v[2], *r;
+        if (!dot || dot == base) dot = p + strlen(p);
+        v[0] = py_strn(p, (size_t)(dot - p));
+        v[1] = py_str(dot);
+        r = py_tuple_from(v, 2);
+        py_release(v[0]); py_release(v[1]);
+        return r;
+    }
+    if (streq(name, "isabs") || streq(name, "path_isabs"))
+        return py_bool(*p == '/');
+    if (streq(name, "normpath") || streq(name, "path_normpath") ||
+        streq(name, "abspath") || streq(name, "path_abspath")) {
+        PyVal *norm = posixpath_norm(args[0]);
+        if (streq(name, "abspath") || streq(name, "path_abspath")) {
+            if (*p != '/') {
+                PyVal *cwd = os_call("getcwd", NULL, 0);
+                PyVal *joined;
+                Buf b;
+                buf_init(&b);
+                buf_adds(&b, py_cstr(cwd));
+                if (b.len && b.data[b.len - 1] != '/') buf_addc(&b, '/');
+                buf_adds(&b, py_cstr(norm));
+                joined = py_strn(b.data ? b.data : "", b.len);
+                free(b.data);
+                {
+                    PyVal *res = posixpath_norm(joined);
+                    py_release(joined); py_release(norm); py_release(cwd);
+                    return res;
+                }
+            }
+        }
+        return norm;
+    }
+    return os_call(name, args, argc);
+}
+
 PyVal *py_module_call(const char *module, const char *name, PyVal **args,
                       size_t argc, PyVal *kwargs) {
     PyVal *r = NULL;
     (void)kwargs;
+    if (streq(module, "posixpath")) {
+        r = posixpath_call(name, args, argc);
+        if (!r) py_raise(PY_EXC_ATTRIBUTE, "posixpath function not supported");
+        return r;
+    }
+    module = canonical_module_name(module);
     if (streq(module, "math")) {
         r = math_call(name, args, argc);
         if (!r) py_raise(PY_EXC_ATTRIBUTE, "math function not supported");
@@ -4082,8 +4879,27 @@ PyVal *py_module_call(const char *module, const char *name, PyVal **args,
     }
     {
         int handled = 0;
+        PyVal *extra = py_extra_call(module, name, args, argc, kwargs, &handled);
+        if (handled) return extra;
+    }
+    {
+        int handled = 0;
         PyVal *extra = py_stdlib_call(module, name, args, argc, kwargs, &handled);
         if (handled) return extra;
+    }
+    {
+        int handled = 0;
+        PyVal *extra = py311_module_call(module, name, args, argc, kwargs,
+                                          &handled);
+        if (handled) return extra;
+    }
+    if (py_module_known(module)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "stdlib module '%s' has no compiled implementation of '%s'",
+                 module, name);
+        py_raise(PY_EXC_UNSUPPORTED, msg);
+        return py_none();
     }
     py_raise(PY_EXC_IMPORT, "module function not available in pure C mode");
     return py_none();
@@ -4122,13 +4938,14 @@ PyVal *py_call_list(PyVal *fn, PyVal *poslist, PyVal *kwargs) {
     return py_call(fn, poslist->u.seq.items, poslist->u.seq.len, kwargs);
 }
 
-PyVal *py_format_value(PyVal *value, const char *spec, int conv) {
-    PyVal *v = NULL, *s, *r, *args[2];
+PyVal *py_format_value_obj(PyVal *value, PyVal *spec, int conv) {
+    PyVal *v, *r, *args[2];
     if (!value) value = py_none();
     if (conv == 1) v = py_repr(value);
     else if (conv == 2) v = py_str_of(value);
+    else if (conv == 3) v = py_ascii_of(value);
     else { v = value; py_retain(v); }
-    if (!spec || !*spec) {
+    if (!spec || (spec->type == PY_T_STR && spec->u.s.len == 0)) {
         if (conv == 0 && value->type != PY_T_STR) {
             PyVal *t = py_str_of(v);
             py_release(v);
@@ -4136,12 +4953,22 @@ PyVal *py_format_value(PyVal *value, const char *spec, int conv) {
         }
         return v;
     }
-    s = py_str(spec ? spec : "");
+    if (spec->type != PY_T_STR) {
+        py_release(v);
+        py_raise(PY_EXC_TYPE, "format spec must be a string");
+        return py_none();
+    }
     args[0] = v;
-    args[1] = s;
+    args[1] = spec; /* borrowed: generated caller owns it */
     r = py_builtin_format(args, 2, NULL);
-    py_release(s);
     py_release(v);
+    return r;
+}
+
+PyVal *py_format_value(PyVal *value, const char *spec, int conv) {
+    PyVal *s = spec ? py_str(spec) : NULL;
+    PyVal *r = py_format_value_obj(value, s, conv);
+    py_release(s);
     return r;
 }
 
@@ -4184,6 +5011,20 @@ PyVal *py_builtin_lookup(const char *name) {
     size_t i;
     for (i = 0; table[i].name; i++)
         if (!strcmp(table[i].name, name)) return py_func(table[i].fn, table[i].name);
+    {
+        /* Constants and exception classes must win over the legacy extra
+           builtin table, which contains a function named __debug__. */
+        PyVal *constant = py311_builtin_const(name);
+        if (constant) return constant;
+    }
+    {
+        PyVal *extra = py_builtin_extra_lookup(name);
+        if (extra) return extra;
+    }
+    {
+        PyVal *full311 = py311_builtin_get(name);
+        if (full311) return full311;
+    }
     return NULL;
 }
 
@@ -4227,6 +5068,62 @@ wchar_t *py_utf16_from_utf8(const char *s) {
 #endif
 }
 
+/* --------------------------------------------------- dead-code-elimination */
+/* The compiler omits pyrt_win.c / pyrt_extra.c / pyrt_builtins.c when the
+   generated program cannot reach them.  These tiny stubs keep the core
+   translation unit self-contained in that configuration. */
+#ifdef PY2C99_NO_GUI
+void py_gui_init(void) {}
+void py_gui_shutdown(void) {}
+PyVal *py_tk_root(void) { py_raise(PY_EXC_OS, "tkinter was not linked into this program"); return py_none(); }
+PyVal *py_tk_widget(int kind, PyVal *parent, PyVal *kwargs) {
+    (void)kind; (void)parent; (void)kwargs;
+    py_raise(PY_EXC_OS, "tkinter was not linked into this program");
+    return py_none();
+}
+PyVal *py_tk_mainloop(void) { return py_none(); }
+PyVal *py_tk_update(void) { return py_none(); }
+PyVal *py_tk_destroy(PyVal *w) { (void)w; return py_none(); }
+PyVal *py_msgbox(int kind, PyVal *message, PyVal *title) {
+    (void)kind; (void)message; (void)title;
+    py_raise(PY_EXC_OS, "tkinter.messagebox was not linked into this program");
+    return py_none();
+}
+PyVal *py_gui_method(PyWidget *w, const char *name, PyVal **args, size_t argc,
+                     PyVal *kwargs) {
+    (void)w; (void)name; (void)args; (void)argc; (void)kwargs;
+    py_raise(PY_EXC_OS, "tkinter was not linked into this program");
+    return py_none();
+}
+PyVal *py_gui_getattr(PyWidget *w, const char *name) {
+    (void)w; (void)name;
+    py_raise(PY_EXC_OS, "tkinter was not linked into this program");
+    return py_none();
+}
+void py_gui_setattr(PyWidget *w, const char *name, PyVal *value) {
+    (void)w; (void)name; (void)value;
+}
+void py_gui_free(PyWidget *w) { (void)w; }
+#endif
+
+#ifdef PY2C99_NO_EXTRA_MODULES
+int py_extra_module_known(const char *module) { (void)module; return 0; }
+PyVal *py_extra_const(const char *module, const char *name) {
+    (void)module; (void)name; return NULL;
+}
+PyVal *py_extra_call(const char *module, const char *name, PyVal **args,
+                     size_t argc, PyVal *kwargs, int *handled) {
+    (void)module; (void)name; (void)args; (void)argc; (void)kwargs;
+    if (handled) *handled = 0;
+    return NULL;
+}
+void py_extra_run_atexit(void) {}
+#endif
+
+#ifdef PY2C99_NO_EXTRA_BUILTINS
+PyVal *py_builtin_extra_lookup(const char *name) { (void)name; return NULL; }
+#endif
+
 /* ---------------------------------------------------------------- lifecycle */
 void py_init(int argc, char **argv_utf8) {
     int i;
@@ -4255,6 +5152,7 @@ void py_init(int argc, char **argv_utf8) {
 }
 
 void py_shutdown(void) {
+    py_extra_run_atexit();
     py_gui_shutdown();
     py_exc_clear();
     py_release(g_argv);

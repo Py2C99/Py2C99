@@ -50,6 +50,9 @@ static void sb_reserve(SBuf *b, size_t extra) {
 }
 
 static void sb_add(SBuf *b, const char *s, size_t n) {
+    /* Guard against a bogus length from a non-string PyVal so GCC's bounds
+       checker can prove the memcpy size (older code passed (size_t)-1). */
+    if (!s || n == (size_t)-1) return;
     sb_reserve(b, n);
     memcpy(b->data + b->len, s, n);
     b->len += n;
@@ -274,8 +277,7 @@ static const ConstEntry g_consts[] = {
 
 static const char *canonical_module(const char *module) {
     if (s_eq(module, "builtins") || s_eq(module, "__builtin__")) return "builtins";
-    if (s_eq(module, "ntpath") || s_eq(module, "posixpath") ||
-        s_eq(module, "genericpath")) return "os.path";
+    if (s_eq(module, "ntpath") || s_eq(module, "genericpath")) return "os.path";
     if (s_eq(module, "collections.abc")) return "collections";
     if (s_eq(module, "urllib.parse")) return "urllib";
     if (s_eq(module, "html.entities")) return "html.entities";
@@ -290,7 +292,8 @@ static const char *g_modules[] = {
     "gc", "json", "csv", "re", "textwrap", "html", "html.entities",
     "base64", "binascii", "zlib", "struct", "codecs", "unicodedata",
     "pathlib", "glob", "fnmatch", "shutil", "tempfile", "subprocess",
-    "stat", "errno", "os.path", "ntpath", "posixpath", "getpass", "sysconfig",
+    "stat", "errno", "os.path", "ntpath", "posixpath", "genericpath",
+    "getpass", "sysconfig",
     "datetime", "calendar", "timeit", "uuid", "hashlib", "secrets",
     "hmac", "socket", "ssl", "urllib", "urllib.parse", "urllib.request",
     "http", "logging", "getopt", "msvcrt", "threading", "multiprocessing",
@@ -299,54 +302,11 @@ static const char *g_modules[] = {
 
 /* ------------------------------------------------------- builtins as module */
 
-typedef struct { const char *name; PyCFunc fn; } FnEntry;
-
-static PyVal *bi_slice(PyVal **args, size_t argc, PyVal *kwargs) {
-    PyVal *f = py_builtin_lookup("slice");
-    PyVal *r;
-    if (!f) return py_none();
-    r = py_call(f, args, argc, kwargs);
-    py_release(f);
-    return r;
-}
-
-static const FnEntry g_builtins[] = {
-    { "print", py_print }, { "input", py_input },
-    { "len", py_builtin_len }, { "int", py_builtin_int },
-    { "float", py_builtin_float }, { "str", py_builtin_str },
-    { "bool", py_builtin_bool }, { "list", py_builtin_list },
-    { "tuple", py_builtin_tuple }, { "dict", py_builtin_dict },
-    { "set", py_builtin_set }, { "frozenset", py_builtin_set },
-    { "range", py_builtin_range }, { "abs", py_builtin_abs },
-    { "min", py_builtin_min }, { "max", py_builtin_max },
-    { "sum", py_builtin_sum }, { "sorted", py_builtin_sorted },
-    { "reversed", py_builtin_reversed }, { "enumerate", py_builtin_enumerate },
-    { "zip", py_builtin_zip }, { "any", py_builtin_any },
-    { "all", py_builtin_all }, { "chr", py_builtin_chr },
-    { "ord", py_builtin_ord }, { "round", py_builtin_round },
-    { "pow", py_builtin_pow }, { "divmod", py_builtin_divmod },
-    { "hex", py_builtin_hex }, { "oct", py_builtin_oct },
-    { "bin", py_builtin_bin }, { "repr", py_builtin_repr },
-    { "format", py_builtin_format }, { "id", py_builtin_id },
-    { "hash", py_builtin_hash }, { "isinstance", py_builtin_isinstance },
-    { "type", py_builtin_type }, { "open", py_builtin_open },
-    { "iter", py_builtin_iter }, { "next", py_builtin_next },
-    { "map", py_builtin_map }, { "filter", py_builtin_filter },
-    { "getattr", py_builtin_getattr }, { "setattr", py_builtin_setattr },
-    { "hasattr", py_builtin_hasattr }, { "callable", py_builtin_callable },
-    { "slice", bi_slice }, { NULL, NULL }
-};
-
 static PyVal *bi_dir(PyVal **args, size_t argc, PyVal *kwargs) {
-    PyVal *r = py_list_new(), *s;
-    size_t i;
+    PyVal *r;
     (void)kwargs;
     (void)args; (void)argc;
-    for (i = 0; g_builtins[i].name; i++) {
-        s = py_str(g_builtins[i].name);
-        py_list_append(r, s);
-        py_release(s);
-    }
+    r = py311_builtin_names();  /* all 158 names from CPython 3.11 */
     sort_list(r, 0);
     return r;
 }
@@ -357,26 +317,36 @@ static PyVal *bi_vars(PyVal **args, size_t argc, PyVal *kwargs) {
     return py_dict_new();
 }
 
-static PyVal *bi_notimpl(PyVal **args, size_t argc, PyVal *kwargs) {
-    (void)args; (void)argc; (void)kwargs;
-    py_raise(PY_EXC_UNSUPPORTED, "not available in py2c99 C mode");
-    return py_none();
-}
-
 static int builtins_call(const char *name, PyVal **args, size_t argc,
                          PyVal *kwargs, PyVal **out) {
-    size_t i;
-    for (i = 0; g_builtins[i].name; i++) {
-        if (s_eq(name, g_builtins[i].name) && g_builtins[i].fn) {
-            *out = g_builtins[i].fn(args, argc, kwargs);
-            return 1;
-        }
+    PyVal *fn;
+    /* One dispatch path for bare builtins and the builtins module: pyrt.c's
+       lookup already covers the core table, pyrt_builtins.c and the generated
+       3.11 registry (constants, exception classes and the remaining helpers). */
+    fn = py_builtin_lookup(name);
+    if (!fn) return 0;
+    if (s_eq(name, "dir")) {
+        PyVal *d = bi_dir(args, argc, kwargs);
+        py_release(fn);
+        *out = d;
+        return 1;
     }
-    if (s_eq(name, "dir")) { *out = bi_dir(args, argc, kwargs); return 1; }
-    if (s_eq(name, "vars")) { *out = bi_vars(args, argc, kwargs); return 1; }
-    if (s_eq(name, "compile") || s_eq(name, "eval") || s_eq(name, "exec"))
-        { *out = bi_notimpl(args, argc, kwargs); return 1; }
-    return 0;
+    if (s_eq(name, "vars")) {
+        PyVal *v = bi_vars(args, argc, kwargs);
+        py_release(fn);
+        *out = v;
+        return 1;
+    }
+    if (fn->type == PY_T_FUNC || fn->type == PY_T_BOUND ||
+        fn->type == PY_T_MODFUNC || fn->type == PY_T_CLASS ||
+        (fn->type == PY_T_DICT && py_dict_get(fn, "__call__"))) {
+        *out = py_call(fn, args, argc, kwargs);
+        py_release(fn);
+        return 1;
+    }
+    /* Constants such as builtins.None / builtins.__debug__. */
+    *out = fn;
+    return 1;
 }
 
 /* ------------------------------------------------------------------- cmath */
@@ -2415,59 +2385,429 @@ static int timeit_call(const char *name, PyVal **args, size_t argc, PyVal **out)
 
 /* ------------------------------------------------------------ hash/uuid/... */
 
-static PyVal *fnv_digest(const char *key, const char *data, size_t n, size_t bytes,
-                         uint64_t seed) {
-    uint64_t h = 1469598103934665603ULL ^ seed;
-    size_t i;
-    char hex[256];
-    if (key) for (i = 0; key[i]; i++) { h ^= (unsigned char)key[i]; h *= 1099511628211ULL; }
-    for (i = 0; i < n; i++) { h ^= (unsigned char)data[i]; h *= 1099511628211ULL; }
-    for (i = 0; i < bytes && i * 2 + 1 < sizeof(hex); i++) {
-        uint64_t part = h ^ (h >> (i % 63));
-        snprintf(hex + i * 2, 3, "%02x", (unsigned)(part & 0xFF));
+/* Real digest implementations: MD5, SHA-1, SHA-224/256 and SHA-384/512.
+   All constants and arithmetic are plain C99; no external crypto library. */
+
+static const uint32_t g_md5_k[64] = {
+    0xd76aa478U, 0xe8c7b756U, 0x242070dbU, 0xc1bdceeeU,
+    0xf57c0fafU, 0x4787c62aU, 0xa8304613U, 0xfd469501U,
+    0x698098d8U, 0x8b44f7afU, 0xffff5bb1U, 0x895cd7beU,
+    0x6b901122U, 0xfd987193U, 0xa679438eU, 0x49b40821U,
+    0xf61e2562U, 0xc040b340U, 0x265e5a51U, 0xe9b6c7aaU,
+    0xd62f105dU, 0x02441453U, 0xd8a1e681U, 0xe7d3fbc8U,
+    0x21e1cde6U, 0xc33707d6U, 0xf4d50d87U, 0x455a14edU,
+    0xa9e3e905U, 0xfcefa3f8U, 0x676f02d9U, 0x8d2a4c8aU,
+    0xfffa3942U, 0x8771f681U, 0x6d9d6122U, 0xfde5380cU,
+    0xa4beea44U, 0x4bdecfa9U, 0xf6bb4b60U, 0xbebfbc70U,
+    0x289b7ec6U, 0xeaa127faU, 0xd4ef3085U, 0x04881d05U,
+    0xd9d4d039U, 0xe6db99e5U, 0x1fa27cf8U, 0xc4ac5665U,
+    0xf4292244U, 0x432aff97U, 0xab9423a7U, 0xfc93a039U,
+    0x655b59c3U, 0x8f0ccc92U, 0xffeff47dU, 0x85845dd1U,
+    0x6fa87e4fU, 0xfe2ce6e0U, 0xa3014314U, 0x4e0811a1U,
+    0xf7537e82U, 0xbd3af235U, 0x2ad7d2bbU, 0xeb86d391U,
+};
+
+static const uint32_t g_sha256_k[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+};
+
+static const uint64_t g_sha512_k[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL, 0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL, 0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL, 0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL, 0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL, 0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
+    0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+};
+
+enum { H_MD5 = 0, H_SHA1, H_SHA224, H_SHA256, H_SHA384, H_SHA512 };
+
+static uint32_t rol32(uint32_t x, unsigned n) { return (x << n) | (x >> (32 - n)); }
+static uint32_t ror32(uint32_t x, unsigned n) { return (x >> n) | (x << (32 - n)); }
+static uint64_t ror64(uint64_t x, unsigned n) { return (x >> n) | (x << (64 - n)); }
+static uint32_t be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static uint64_t be64(const unsigned char *p) {
+    uint64_t v = 0; unsigned i;
+    for (i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+static void md5_compress(uint32_t st[4], const unsigned char *blk) {
+    static const unsigned char sh[64] = {
+        7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+        5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+        4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+        6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
+    };
+    uint32_t m[16], a = st[0], b = st[1], c = st[2], d = st[3];
+    unsigned i;
+    for (i = 0; i < 16; i++)
+        m[i] = (uint32_t)blk[i*4] | ((uint32_t)blk[i*4+1] << 8) |
+               ((uint32_t)blk[i*4+2] << 16) | ((uint32_t)blk[i*4+3] << 24);
+    for (i = 0; i < 64; i++) {
+        uint32_t f, t; unsigned g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5*i + 1) & 15; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3*i + 5) & 15; }
+        else { f = c ^ (b | ~d); g = (7*i) & 15; }
+        t = d; d = c; c = b;
+        b += rol32(a + f + g_md5_k[i] + m[g], sh[i]);
+        a = t;
     }
-    return py_strn(hex, bytes * 2);
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+}
+
+static void sha1_compress(uint32_t st[5], const unsigned char *blk) {
+    uint32_t w[80], a = st[0], b = st[1], c = st[2], d = st[3], e = st[4];
+    unsigned i;
+    for (i = 0; i < 16; i++) w[i] = be32(blk + i*4);
+    for (i = 16; i < 80; i++)
+        w[i] = rol32(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    for (i = 0; i < 80; i++) {
+        uint32_t f, k, t;
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999U; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1U; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdcU; }
+        else { f = b ^ c ^ d; k = 0xca62c1d6U; }
+        t = rol32(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = rol32(b, 30); b = a; a = t;
+    }
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d; st[4] += e;
+}
+
+static void sha256_compress(uint32_t st[8], const unsigned char *blk) {
+    uint32_t w[64], a = st[0], b = st[1], c = st[2], d = st[3];
+    uint32_t e = st[4], f = st[5], g = st[6], h = st[7];
+    unsigned i;
+    for (i = 0; i < 16; i++) w[i] = be32(blk + i*4);
+    for (i = 16; i < 64; i++) {
+        uint32_t s0 = ror32(w[i-15], 7) ^ ror32(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = ror32(w[i-2], 17) ^ ror32(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    for (i = 0; i < 64; i++) {
+        uint32_t s1 = ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + s1 + ch + g_sha256_k[i] + w[i];
+        uint32_t s0 = ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+    st[4] += e; st[5] += f; st[6] += g; st[7] += h;
+}
+
+static void sha512_compress(uint64_t st[8], const unsigned char *blk) {
+    uint64_t w[80], a = st[0], b = st[1], c = st[2], d = st[3];
+    uint64_t e = st[4], f = st[5], g = st[6], h = st[7];
+    unsigned i;
+    for (i = 0; i < 16; i++) w[i] = be64(blk + i*8);
+    for (i = 16; i < 80; i++) {
+        uint64_t s0 = ror64(w[i-15], 1) ^ ror64(w[i-15], 8) ^ (w[i-15] >> 7);
+        uint64_t s1 = ror64(w[i-2], 19) ^ ror64(w[i-2], 61) ^ (w[i-2] >> 6);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    for (i = 0; i < 80; i++) {
+        uint64_t s1 = ror64(e, 14) ^ ror64(e, 18) ^ ror64(e, 41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        uint64_t t1 = h + s1 + ch + g_sha512_k[i] + w[i];
+        uint64_t s0 = ror64(a, 28) ^ ror64(a, 34) ^ ror64(a, 39);
+        uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint64_t t2 = s0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    st[0] += a; st[1] += b; st[2] += c; st[3] += d;
+    st[4] += e; st[5] += f; st[6] += g; st[7] += h;
+}
+
+static int hash_from_name(const char *n) {
+    if (s_eq(n, "md5")) return H_MD5;
+    if (s_eq(n, "sha1")) return H_SHA1;
+    if (s_eq(n, "sha224")) return H_SHA224;
+    if (s_eq(n, "sha256")) return H_SHA256;
+    if (s_eq(n, "sha384")) return H_SHA384;
+    if (s_eq(n, "sha512")) return H_SHA512;
+    if (s_eq(n, "blake2b") || s_eq(n, "blake2s")) {
+        py_raise(PY_EXC_VALUE, "blake2 is not available in pure C mode");
+        return -2;
+    }
+    return -1;
+}
+
+static size_t hash_size(int alg) {
+    switch (alg) {
+    case H_MD5: return 16;
+    case H_SHA1: return 20;
+    case H_SHA224: return 28;
+    case H_SHA256: return 32;
+    case H_SHA384: return 48;
+    default: return 64;
+    }
+}
+
+static size_t hash_block(int alg) {
+    return (alg == H_SHA384 || alg == H_SHA512) ? 128 : 64;
+}
+
+static void hash_raw(int alg, const char *msg, size_t len,
+                     unsigned char *out, size_t *out_len) {
+    static const uint32_t iv256[8] = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
+    };
+    static const uint32_t iv224[8] = {
+        0xc1059ed8U, 0x367cd507U, 0x3070dd17U, 0xf70e5939U,
+        0xffc00b31U, 0x68581511U, 0x64f98fa7U, 0xbefa4fa4U
+    };
+    static const uint64_t iv512[8] = {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+        0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+        0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+    };
+    static const uint64_t iv384[8] = {
+        0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
+        0x9159015a3070dd17ULL, 0x152fecd8f70e5939ULL,
+        0x67332667ffc00b31ULL, 0x8eb44a8768581511ULL,
+        0xdb0c2e0d64f98fa7ULL, 0x47b5481dbefa4fa4ULL
+    };
+    uint32_t h32[8];
+    uint64_t h64[8];
+    size_t block = hash_block(alg), tail = (block == 128) ? 16 : 8;
+    uint64_t bits = (uint64_t)len * 8;
+    size_t n = ((len + 1 + tail + block - 1) / block) * block;
+    size_t off, i;
+    unsigned char *p = (unsigned char *)calloc(n, 1);
+    if (!p) { *out_len = 0; return; }
+    memcpy(p, msg, len);
+    p[len] = 0x80;
+    if (tail == 8) {
+        if (alg == H_MD5) {
+            for (i = 0; i < 8; i++) p[n - 8 + i] = (unsigned char)(bits >> (8*i));
+        } else {
+            for (i = 0; i < 8; i++) p[n - 1 - i] = (unsigned char)(bits >> (8*i));
+        }
+    } else {
+        for (i = 0; i < 8; i++) p[n - 1 - i] = (unsigned char)(bits >> (8*i));
+    }
+    if (alg == H_MD5) {
+        h32[0] = 0x67452301U; h32[1] = 0xefcdab89U;
+        h32[2] = 0x98badcfeU; h32[3] = 0x10325476U;
+        for (off = 0; off < n; off += block) md5_compress(h32, p + off);
+        for (i = 0; i < 4; i++)
+            for (off = 0; off < 4; off++)
+                out[i*4 + off] = (unsigned char)(h32[i] >> (8*off));
+    } else if (alg == H_SHA1) {
+        h32[0] = 0x67452301U; h32[1] = 0xefcdab89U; h32[2] = 0x98badcfeU;
+        h32[3] = 0x10325476U; h32[4] = 0xc3d2e1f0U;
+        for (off = 0; off < n; off += block) sha1_compress(h32, p + off);
+        for (i = 0; i < 5; i++)
+            for (off = 0; off < 4; off++)
+                out[i*4 + off] = (unsigned char)(h32[i] >> (24 - 8*off));
+    } else if (alg == H_SHA224 || alg == H_SHA256) {
+        const uint32_t *iv = (alg == H_SHA224) ? iv224 : iv256;
+        for (i = 0; i < 8; i++) h32[i] = iv[i];
+        for (off = 0; off < n; off += block) sha256_compress(h32, p + off);
+        for (i = 0; i < 8; i++)
+            for (off = 0; off < 4; off++)
+                out[i*4 + off] = (unsigned char)(h32[i] >> (24 - 8*off));
+    } else {
+        const uint64_t *iv = (alg == H_SHA384) ? iv384 : iv512;
+        for (i = 0; i < 8; i++) h64[i] = iv[i];
+        for (off = 0; off < n; off += block) sha512_compress(h64, p + off);
+        for (i = 0; i < 8; i++)
+            for (off = 0; off < 8; off++)
+                out[i*8 + off] = (unsigned char)(h64[i] >> (56 - 8*off));
+    }
+    free(p);
+    *out_len = hash_size(alg);
+}
+
+static PyVal *hash_hex(int alg, const char *data, size_t len) {
+    unsigned char d[64];
+    size_t n = 0, i;
+    char hex[129];
+    hash_raw(alg, data, len, d, &n);
+    for (i = 0; i < n; i++) snprintf(hex + i*2, 3, "%02x", d[i]);
+    hex[n*2] = 0;
+    return py_strn(hex, n*2);
+}
+
+static PyVal *hash_bytes(int alg, const char *data, size_t len) {
+    unsigned char d[64];
+    size_t n = 0;
+    hash_raw(alg, data, len, d, &n);
+    return py_strn((const char *)d, n);
+}
+
+static PyVal *hash_object(int alg, const char *data, size_t len) {
+    PyVal *obj = py_dict_new();
+    PyVal *v, *b;
+    static const char *const methods[] = {
+        "hexdigest", "digest", "update", "copy", NULL
+    };
+    unsigned i;
+    v = py_dict_new();
+    v = py_class(v, "HASH");
+    py_dict_put(obj, "__class__", v);
+    py_release(v);
+    py_dict_put(obj, "_alg", py_int(alg));
+    py_dict_put(obj, "_data", py_strn(data, len));
+    for (i = 0; methods[i]; i++) {
+        char internal[32];
+        snprintf(internal, sizeof(internal), "_%s", methods[i]);
+        v = py_module_attr("hashlib", internal);
+        b = py_bound(v, obj);
+        py_dict_put(obj, methods[i], b);
+        py_release(b);
+        py_release(v);
+    }
+    return obj;
+}
+
+static int hash_self(PyVal *self, int *alg, const char **data, size_t *len) {
+    PyVal *a = py_dict_get(self, "_alg");
+    PyVal *d = py_dict_get(self, "_data");
+    if (!a || !d || a->type != PY_T_INT || d->type != PY_T_STR) return 0;
+    *alg = (int)py_as_int(a);
+    *data = d->u.s.data;
+    *len = d->u.s.len;
+    return 1;
 }
 
 static int hashlib_call(const char *name, PyVal **args, size_t argc, PyVal **out) {
-    PyVal *data = one_arg(args, argc, name);
-    const char *s = py_cstr(data);
-    size_t n = py_cstr_len(data);
-    size_t bytes;
-    uint64_t seed;
+    int alg;
+    PyVal *data;
     if (s_eq(name, "algorithms_available") || s_eq(name, "algorithms_guaranteed")) {
-        const char *names[] = { "md5", "sha1", "sha256", "sha512", "blake2b" };
-        PyVal *vals[5]; size_t i;
-        for (i = 0; i < 5; i++) vals[i] = py_str(names[i]);
-        *out = py_list_from(vals, 5);
-        for (i = 0; i < 5; i++) py_release(vals[i]);
+        const char *names[] = { "md5", "sha1", "sha224", "sha256", "sha384", "sha512" };
+        PyVal *vals[6]; size_t i;
+        for (i = 0; i < 6; i++) vals[i] = py_str(names[i]);
+        *out = py_list_from(vals, 6);
+        for (i = 0; i < 6; i++) py_release(vals[i]);
         return 1;
     }
-    if (s_eq(name, "new")) {
-        const char *alg = sarg(args, argc, 0, "md5");
-        PyVal *dv = argc > 1 ? args[1] : py_str("");
-        int ok = hashlib_call(alg, &dv, 1, out);
-        if (dv != data) py_release(dv);
-        return ok;
+    if (name[0] == '_') {
+        int a; const char *s; size_t n; SBuf b;
+        if (!argc || !hash_self(args[0], &a, &s, &n)) return 0;
+        if (s_eq(name, "_hexdigest")) { *out = hash_hex(a, s, n); return 1; }
+        if (s_eq(name, "_digest")) { *out = hash_bytes(a, s, n); return 1; }
+        if (s_eq(name, "_copy")) { *out = hash_object(a, s, n); return 1; }
+        if (s_eq(name, "_update")) {
+            PyVal *d = argc > 1 ? args[1] : py_str("");
+            sb_init(&b);
+            sb_add(&b, s, n);
+            sb_adds(&b, py_cstr(d));
+            py_dict_put(args[0], "_data", py_strn(b.data ? b.data : "", b.len));
+            free(b.data);
+            *out = py_none();
+            return 1;
+        }
+        return 0;
     }
-    if (s_eq(name, "md5")) { bytes = 16; seed = 0x01; }
-    else if (s_eq(name, "sha1")) { bytes = 20; seed = 0x02; }
-    else if (s_eq(name, "sha256")) { bytes = 32; seed = 0x03; }
-    else if (s_eq(name, "sha512") || s_eq(name, "blake2b")) { bytes = 64; seed = 0x04; }
-    else return 0;
-    *out = fnv_digest(NULL, s, n, bytes, seed);
+    alg = hash_from_name(name);
+    if (alg == -2) { *out = py_none(); return 1; }
+    if (alg < 0) {
+        if (!s_eq(name, "new") && !s_eq(name, "hmac_new")) return 0;
+        alg = hash_from_name(sarg(args, argc, 0, "md5"));
+        if (alg < 0) return 0;
+        data = argc > 1 ? args[1] : py_str("");
+        *out = hash_object(alg, py_cstr(data), py_cstr_len(data));
+        return 1;
+    }
+    data = one_arg(args, argc, name);
+    *out = hash_object(alg, py_cstr(data), py_cstr_len(data));
     return 1;
 }
 
 static int hmac_call(const char *name, PyVal **args, size_t argc, PyVal **out) {
     if (s_eq(name, "new")) {
-        const char *key = sarg(args, argc, 0, ""), *msg = sarg(args, argc, 1, "");
-        *out = fnv_digest(key, msg, strlen(msg), 32, 0x55);
+        const char *key = sarg(args, argc, 0, "");
+        const char *msg = sarg(args, argc, 1, "");
+        int alg = H_MD5;
+        size_t klen = strlen(key), mlen = strlen(msg);
+        size_t bs, i;
+        unsigned char *k, *inner, *outer;
+        unsigned char ih[64];
+        size_t in = 0;
+        if (argc > 2) {
+            const char *mn = NULL;
+            if (args[2]->type == PY_T_STR) mn = py_cstr(args[2]);
+            else if (args[2]->type == PY_T_MODFUNC) mn = args[2]->u.modfunc.name;
+            if (mn) {
+                int a = hash_from_name(mn);
+                if (a >= 0) alg = a;
+            }
+        }
+        if (argc <= 2 || (args[2]->type != PY_T_STR && args[2]->type != PY_T_MODFUNC)) {
+            py_raise(PY_EXC_TYPE, "Missing required parameter 'digestmod'.");
+            *out = py_none();
+            return 1;
+        }
+        bs = hash_block(alg);
+        k = (unsigned char *)calloc(bs, 1);
+        if (!k) { *out = py_str(""); return 1; }
+        if (klen > bs) {
+            unsigned char raw[64]; size_t rn = 0;
+            hash_raw(alg, key, klen, raw, &rn);
+            memcpy(k, raw, rn > bs ? bs : rn);
+        } else {
+            memcpy(k, key, klen);
+        }
+        inner = (unsigned char *)malloc(bs + mlen + 1);
+        outer = (unsigned char *)malloc(bs + 64 + 1);
+        if (inner && outer) {
+            for (i = 0; i < bs; i++) inner[i] = (unsigned char)(k[i] ^ 0x36);
+            memcpy(inner + bs, msg, mlen);
+            hash_raw(alg, (const char *)inner, bs + mlen, ih, &in);
+            for (i = 0; i < bs; i++) outer[i] = (unsigned char)(k[i] ^ 0x5c);
+            memcpy(outer + bs, ih, in);
+            *out = hash_object(alg, (const char *)outer, bs + in);
+        } else {
+            *out = py_str("");
+        }
+        free(outer);
+        free(inner);
+        free(k);
         return 1;
     }
     if (s_eq(name, "compare_digest")) {
         *out = py_bool(py_cmp(PY_CMP_EQ, one_arg(args, argc, "compare_digest"),
-                             argc > 1 ? args[1] : py_none()));
+                              argc > 1 ? args[1] : py_none()));
         return 1;
     }
     return 0;
@@ -2918,6 +3258,101 @@ static int syslib_call(const char *module, const char *name, PyVal **args,
     return 1;
 }
 
+/* --------------------------------------------------------- html.entities */
+
+typedef struct { const char *name; const char *value; int cp; } HtmlEntity;
+static const HtmlEntity g_html_entities[] = {
+    { "amp", "&", 38 }, { "lt", "<", 60 }, { "gt", ">", 62 },
+    { "quot", "\"", 34 }, { "apos", "'", 39 },
+    { "AMP", "&", 38 }, { "LT", "<", 60 }, { "GT", ">", 62 },
+    { "QUOT", "\"", 34 }, { "APOS", "'", 39 }, { "nbsp", "\xC2\xA0", 160 },
+    { "copy", "\xC2\xA9", 169 }, { "reg", "\xC2\xAE", 174 },
+    { "trade", "\xE2\x84\xA2", 8482 }, { "hellip", "\xE2\x80\xA6", 8230 },
+    { "mdash", "\xE2\x80\x94", 8212 }, { "ndash", "\xE2\x80\x93", 8211 },
+    { "lsquo", "\xE2\x80\x98", 8216 }, { "rsquo", "\xE2\x80\x99", 8217 },
+    { "ldquo", "\xE2\x80\x9C", 8220 }, { "rdquo", "\xE2\x80\x9D", 8221 },
+    { "laquo", "\xC2\xAB", 171 }, { "raquo", "\xC2\xBB", 187 },
+    { "euro", "\xE2\x82\xAC", 8364 }, { "pound", "\xC2\xA3", 163 },
+    { "yen", "\xC2\xA5", 165 }, { "cent", "\xC2\xA2", 162 },
+    { "sect", "\xC2\xA7", 167 }, { "para", "\xC2\xB6", 182 },
+    { "deg", "\xC2\xB0", 176 }, { "plusmn", "\xC2\xB1", 177 },
+    { "times", "\xC3\x97", 215 }, { "divide", "\xC3\xB7", 247 },
+    { "frac12", "\xC2\xBD", 189 }, { "frac14", "\xC2\xBC", 188 },
+    { "frac34", "\xC2\xBE", 190 }, { "bull", "\xE2\x80\xA2", 8226 },
+    { "middot", "\xC2\xB7", 183 }, { "not", "\xC2\xAC", 172 },
+    { "micro", "\xC2\xB5", 181 }, { "iexcl", "\xC2\xA1", 161 },
+    { "iquest", "\xC2\xBF", 191 }, { "acute", "\xC2\xB4", 180 },
+    { "cedil", "\xC2\xB8", 184 }, { "macr", "\xC2\xAF", 175 },
+    { "brvbar", "\xC2\xA6", 166 }, { "uml", "\xC2\xA8", 168 },
+    { "ordf", "\xC2\xAA", 170 }, { "ordm", "\xC2\xBA", 186 },
+    { "sup1", "\xC2\xB9", 185 }, { "sup2", "\xC2\xB2", 178 },
+    { "sup3", "\xC2\xB3", 179 }, { "permil", "\xE2\x80\xB0", 8240 },
+    { "alpha", "\xCE\xB1", 945 }, { "beta", "\xCE\xB2", 946 },
+    { "gamma", "\xCE\xB3", 947 }, { "delta", "\xCE\xB4", 948 },
+    { "pi", "\xCF\x80", 960 }, { "sigma", "\xCF\x83", 963 },
+    { "Omega", "\xCE\xA9", 937 }, { "infin", "\xE2\x88\x9E", 8734 },
+    { NULL, NULL, 0 }
+};
+
+static PyVal *html_entities_const(const char *module, const char *name) {
+    size_t i;
+    int html5 = s_eq(name, "html5");
+    int entitydefs = s_eq(name, "entitydefs");
+    int name2cp = s_eq(name, "name2codepoint");
+    int cp2name = s_eq(name, "codepoint2name");
+    PyVal *r;
+    if (!s_eq(module, "html.entities") ||
+        (!html5 && !entitydefs && !name2cp && !cp2name)) return NULL;
+    r = py_dict_new();
+    for (i = 0; g_html_entities[i].name; i++) {
+        const HtmlEntity *e = &g_html_entities[i];
+        PyVal *value = py_str(e->value);
+        if (html5) {
+            char key[64];
+            py_dict_put(r, e->name, value);
+            snprintf(key, sizeof(key), "%s;", e->name);
+            py_dict_put(r, key, value);
+        } else if (entitydefs || name2cp) {
+            char base[64], *p = base;
+            const char *src = e->name;
+            while (*src && p < base + sizeof(base) - 2) {
+                if (*src != ';') {
+                    char c = *src;
+                    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+                    *p++ = c;
+                }
+                src++;
+            }
+            *p = 0;
+            py_dict_put(r, base, name2cp ? py_int(e->cp) : value);
+        } else {
+            char base[64], *p = base;
+            const char *src = e->name;
+            PyVal *nm, *cp;
+            while (*src && p < base + sizeof(base) - 1) {
+                char c = *src++;
+                if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+                *p++ = c;
+            }
+            *p = 0;
+            nm = py_str(base);
+            cp = py_int(e->cp);
+            py_dict_strkey(r, cp, nm);
+            py_release(cp);
+            py_release(nm);
+        }
+        py_release(value);
+    }
+    if (cp2name) {
+        PyVal *amp = py_str("amp");
+        PyVal *cp = py_int(38);
+        py_dict_strkey(r, cp, amp);
+        py_release(cp);
+        py_release(amp);
+    }
+    return r;
+}
+
 /* ---------------------------------------------------------------- dispatch */
 
 int py_stdlib_module_known(const char *module) {
@@ -2930,8 +3365,11 @@ int py_stdlib_module_known(const char *module) {
 
 PyVal *py_stdlib_const(const char *module, const char *name) {
     const char *m = canonical_module(module);
+    PyVal *html;
     size_t i;
     if (!py_stdlib_module_known(m)) return NULL;
+    html = html_entities_const(m, name);
+    if (html) return html;
     for (i = 0; i < sizeof(g_consts) / sizeof(g_consts[0]); i++) {
         if (!s_eq(g_consts[i].module, m) || !s_eq(g_consts[i].name, name)) continue;
         switch (g_consts[i].kind) {
