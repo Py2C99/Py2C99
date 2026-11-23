@@ -10,11 +10,11 @@ Python value is a reference counted PyVal.
 
 Usage:
     py2c99                                      # start the interactive REPL
-    python py2c99.py program.py                 # build program.exe
-    python py2c99.py program.py -o app.exe      # choose output name
-    python py2c99.py program.py --run           # build and run
-    python py2c99.py program.py --keep          # keep generated C
-    python py2c99.py program.py -v              # show the gcc command
+    py2c99 program.py                 # build program.exe
+    py2c99 program.py -o app.exe      # choose output name
+    py2c99 program.py --run           # build and run
+    py2c99 program.py --keep          # keep generated C
+    py2c99 program.py -v              # show the gcc command
 
 Supported highlights:
     functions, defaults, *args/**kwargs, classes/methods/inheritance,
@@ -2670,7 +2670,7 @@ def build(source, output, keep, verbose, run, extra_cflags, lto=False,
         if not quiet:
             sys.stderr.write("py2c99: kept generated C at %s\n" % kept)
 
-    gcc = os.environ.get("CC", "gcc")
+    gcc = "mingw64\bin\gcc"
     gui = uses_gui(tree)
     imports = imported_modules(tree)
     need_extra = any(mod in EXTRA_MODULES for mod in imports)
@@ -2696,6 +2696,7 @@ def build(source, output, keep, verbose, run, extra_cflags, lto=False,
            "-ffunction-sections", "-fdata-sections",
            "-Wno-discarded-qualifiers",
            "-municode", "-o", output] + defs + sources + [
+           "-I", HERE,
            "-I", RUNTIME,
            "-Wl,--gc-sections",
            "-luser32", "-lgdi32", "-lcomctl32", "-lws2_32", "-lm"]
