@@ -3,7 +3,8 @@
 py2c99 - transpile a useful subset of Python 3 to portable C99.
 
 The generated program links against runtime/pyrt.c (core object model),
-runtime/pyrt_stdlib.c (65+ standard-library shims) and, on Windows, the
+runtime/pyrt_stdlib.c and runtime/pyrt_extra.c (140+ pure-C stdlib modules),
+runtime/pyrt_builtins.c (remaining Python 3.11 builtins) and, on Windows, the
 native tkinter shim runtime/pyrt_win.c.  There is no CPython involved: every
 Python value is a reference counted PyVal.
 
@@ -17,10 +18,11 @@ Usage:
 
 Supported highlights:
     functions, defaults, *args/**kwargs, classes/methods/inheritance,
-    if/while/for/break/continue/else, try/except/finally, with, raise,
-    comprehensions, lambdas with closures, f-strings, imports of 65+
-    standard-library modules, a persistent no-argument REPL, and
-    tkinter/ttk widgets.
+    user-defined exception classes, if/while/for/break/continue/else,
+    try/except/finally, with, raise,
+    comprehensions, lambdas with closures, f-strings, imports of 140+
+    standard-library modules with real C99 implementations, a persistent
+    no-argument REPL, and tkinter/ttk widgets.
 """
 
 import argparse
@@ -112,7 +114,41 @@ BUILTIN_NAMES = {
     "enumerate", "zip", "any", "all", "chr", "ord", "round", "pow", "divmod",
     "hex", "oct", "bin", "repr", "format", "id", "hash", "isinstance", "type",
     "open", "iter", "next", "map", "filter", "getattr", "setattr", "hasattr",
-    "callable", "slice", "frozenset",
+    "callable", "slice", "frozenset", "ascii", "issubclass", "delattr",
+    "aiter", "anext", "breakpoint", "globals", "locals", "object", "property",
+    "staticmethod", "classmethod", "super", "memoryview", "help", "exit", "quit",
+    "bytes", "bytearray", "dir", "vars", "__import__",
+    "compile", "eval", "exec",
+    # Remaining Python 3.11 builtins, served by runtime/pyrt_311.c.
+    "complex", "__build_class__", "copyright", "credits", "license",
+}
+
+# Builtins implemented in runtime/pyrt_builtins.c.  Keeping this list precise
+# lets the build drop that translation unit when the program never uses it.
+EXTRA_BUILTIN_NAMES = {
+    "aiter", "anext", "ascii", "breakpoint", "bytearray", "bytes", "classmethod",
+    "compile", "delattr", "dir", "eval", "exec", "exit", "globals", "help",
+    "issubclass", "locals", "memoryview", "object", "property", "quit",
+    "staticmethod", "super", "vars", "__import__",
+}
+
+# Modules implemented in runtime/pyrt_extra.c (the second stdlib wave).
+EXTRA_MODULES = {
+    "statistics", "fractions", "decimal", "colorsys", "difflib", "reprlib",
+    "keyword", "ast", "dis", "opcode", "configparser", "netrc", "xdrlib",
+    "plistlib", "quopri", "uu", "mimetypes", "html.parser",
+    "xml.etree.ElementTree", "io", "pickle", "copyreg", "marshal", "shelve",
+    "dbm", "tarfile", "zipfile", "wave", "aifc", "sunau", "chunk",
+    "fileinput", "filecmp", "linecache", "locale", "gettext", "atexit",
+    "warnings", "traceback", "contextvars", "graphlib", "sched", "selectors",
+    "mmap", "socket", "signal", "select", "ftplib", "smtplib", "poplib",
+    "email", "email.utils", "http.client", "urllib.robotparser",
+    "urllib.error", "webbrowser", "zoneinfo", "tomllib", "zipapp",
+    "importlib", "importlib.util", "runpy", "pkgutil", "modulefinder",
+    "site", "code", "codeop", "token", "tabnanny", "symtable", "pydoc",
+    "doctest", "unittest", "typing_extensions", "audioop", "sre_compile",
+    "sre_parse", "genericpath", "shlex", "stringprep", "platformdirs",
+    "diskcache",
 }
 
 TYPE_NAMES = {
@@ -148,6 +184,55 @@ EXC_KINDS = {
     "SystemExit": "PY_EXC_BASE",
     "TclError": "PY_EXC_RUNTIME",
     "tkinter.TclError": "PY_EXC_RUNTIME",
+    "BaseExceptionGroup": "PY_EXC_BASE",
+    "ExceptionGroup": "PY_EXC_EXCEPTION",
+    "GeneratorExit": "PY_EXC_BASE",
+    "KeyboardInterrupt": "PY_EXC_BASE",
+    "SystemError": "PY_EXC_RUNTIME",
+    "RecursionError": "PY_EXC_RUNTIME",
+    "ReferenceError": "PY_EXC_RUNTIME",
+    "StopAsyncIteration": "PY_EXC_STOP_ITERATION",
+    "LookupError": "PY_EXC_INDEX",
+    "IndexError": "PY_EXC_INDEX",
+    "BufferError": "PY_EXC_RUNTIME",
+    "ArithmeticError": "PY_EXC_ARITHMETIC",
+    "FloatingPointError": "PY_EXC_ARITHMETIC",
+    "EnvironmentError": "PY_EXC_OS",
+    "WindowsError": "PY_EXC_OS",
+    "BlockingIOError": "PY_EXC_OS",
+    "BrokenPipeError": "PY_EXC_OS",
+    "ChildProcessError": "PY_EXC_OS",
+    "ConnectionError": "PY_EXC_OS",
+    "ConnectionAbortedError": "PY_EXC_OS",
+    "ConnectionRefusedError": "PY_EXC_OS",
+    "ConnectionResetError": "PY_EXC_OS",
+    "FileExistsError": "PY_EXC_FILE",
+    "InterruptedError": "PY_EXC_OS",
+    "IsADirectoryError": "PY_EXC_FILE",
+    "NotADirectoryError": "PY_EXC_FILE",
+    "PermissionError": "PY_EXC_OS",
+    "ProcessLookupError": "PY_EXC_OS",
+    "TimeoutError": "PY_EXC_OS",
+    "IndentationError": "PY_EXC_VALUE",
+    "TabError": "PY_EXC_VALUE",
+    "SyntaxError": "PY_EXC_VALUE",
+    "UnboundLocalError": "PY_EXC_NAME",
+    "UnicodeError": "PY_EXC_VALUE",
+    "UnicodeDecodeError": "PY_EXC_VALUE",
+    "UnicodeEncodeError": "PY_EXC_VALUE",
+    "UnicodeTranslateError": "PY_EXC_VALUE",
+    "Warning": "PY_EXC_EXCEPTION",
+    "BytesWarning": "PY_EXC_EXCEPTION",
+    "DeprecationWarning": "PY_EXC_EXCEPTION",
+    "EncodingWarning": "PY_EXC_EXCEPTION",
+    "FutureWarning": "PY_EXC_EXCEPTION",
+    "ImportWarning": "PY_EXC_EXCEPTION",
+    "PendingDeprecationWarning": "PY_EXC_EXCEPTION",
+    "ResourceWarning": "PY_EXC_EXCEPTION",
+    "RuntimeWarning": "PY_EXC_EXCEPTION",
+    "SyntaxWarning": "PY_EXC_EXCEPTION",
+    "UnicodeWarning": "PY_EXC_EXCEPTION",
+    "UserWarning": "PY_EXC_EXCEPTION",
 }
 
 BIN_OPS = {
@@ -1204,6 +1289,9 @@ class FnEmitter:
             module = self.m.star_modules[0]
             self.e("PyVal *%s = py_module_attr(%s, %s);" % (t, cstr(module), cstr(name)))
             return t
+        if name == "__debug__":
+            self.e("PyVal *%s = py_bool(1);" % t)
+            return t
         if name in BUILTIN_NAMES:
             self.e("PyVal *%s = py_builtin_lookup(%s);" % (t, cstr(name)))
             return t
@@ -1358,17 +1446,22 @@ class FnEmitter:
         if isinstance(node, ast.JoinedStr):
             return self.gen_fstring(node)
         if isinstance(node, ast.FormattedValue):
-            spec = ""
-            if isinstance(node.format_spec, ast.JoinedStr):
-                spec = self.static_string(node.format_spec)
             v = self.gen(node.value)
+            spec = self.gen_format_spec(node.format_spec)
             t = self.tmp()
             conv = 0
             if node.conversion == ord("r"):
                 conv = 1
             elif node.conversion == ord("s"):
                 conv = 2
-            self.e("PyVal *%s = py_format_value(%s, %s, %d);" % (t, v, cstr(spec), conv))
+            elif node.conversion == ord("a"):
+                conv = 3
+            if spec is None:
+                self.e("PyVal *%s = py_format_value(%s, NULL, %d);" % (t, v, conv))
+            else:
+                self.e("PyVal *%s = py_format_value_obj(%s, %s, %d);" %
+                       (t, v, spec, conv))
+                self.e("py_release(%s);" % spec)
             self.e("py_release(%s);" % v)
             return t
         if isinstance(node, ast.Lambda):
@@ -1418,6 +1511,10 @@ class FnEmitter:
             self.e("PyVal *%s = py_str(%s);" % (t, cstr(v)))
         elif isinstance(v, bytes):
             self.e("PyVal *%s = py_str(%s);" % (t, cstr(v.decode("utf-8", "replace"))))
+        elif v is Ellipsis:
+            self.e("PyVal *%s = py_str(\"Ellipsis\");" % t)
+        elif v is NotImplemented:
+            self.e("PyVal *%s = py_str(\"NotImplemented\");" % t)
         else:
             warn("unsupported constant %r" % (v,), node)
             self.e("PyVal *%s = py_none();" % t)
@@ -1672,6 +1769,26 @@ class FnEmitter:
                 return ""
         return "".join(parts)
 
+    def gen_format_spec(self, node):
+        """Build a format spec as a PyVal, including nested expressions.
+
+        A literal-only spec stays a single py_str() call.  A spec containing
+        FormattedValue nodes is generated as a real JoinedStr so that values
+        such as f"{x:{width}.{prec}f}" work like Python 3.11.
+        """
+        if node is None:
+            return None
+        values = node.values if isinstance(node, ast.JoinedStr) else [node]
+        if all(isinstance(v, ast.Constant) and isinstance(v.value, str)
+               for v in values):
+            s = self.tmp()
+            self.e("PyVal *%s = py_str(%s);" %
+                   (s, cstr("".join(v.value for v in values))))
+            return s
+        if isinstance(node, ast.JoinedStr):
+            return self.gen_fstring(node)
+        return self.gen(node)
+
     def gen_fstring(self, node):
         parts = []
         for part in node.values:
@@ -1718,6 +1835,19 @@ class FnEmitter:
         return t
 
     # calls ---------------------------------------------------------------
+    def gen_scope_snapshot(self, kind):
+        """Build a snapshot dict for globals()/locals()/no-arg dir()."""
+        d = self.tmp()
+        self.e("PyVal *%s = py_dict_new();" % d)
+        if kind == "locals":
+            slots = [(n, self.local(n)) for n in sorted(self.local_names)]
+        else:
+            slots = sorted(self.m.global_map.items())
+        for name, slot in slots:
+            self.e("if (%s) py_dict_put(%s, %s, %s);" %
+                   (slot, d, cstr(name), slot))
+        return d
+
     def gen_call(self, node):
         func = node.func
         # tkinter constructors
@@ -1733,9 +1863,20 @@ class FnEmitter:
                 return self.gen_var_ctor(func.id, node)
             if func.id == "isinstance":
                 return self.gen_isinstance(node)
-            if func.id == "super":
-                warn("super() is not supported", node)
-                return self.const_none()
+            if func.id in ("globals", "locals") and not node.args \
+                    and not node.keywords:
+                return self.gen_scope_snapshot(func.id)
+            if func.id == "dir" and not node.args and not node.keywords:
+                scope = "locals" if self.in_function else "globals"
+                d = self.gen_scope_snapshot(scope)
+                fn = self.tmp()
+                self.e("PyVal *%s = py_builtin_lookup(\"dir\");" % fn)
+                argv = self.tmp()
+                self.e("PyVal *%s[] = {%s};" % (argv, d))
+                t = self.tmp()
+                self.e("PyVal *%s = py_call(%s, %s, 1, NULL);" % (t, fn, argv))
+                self.e("py_release(%s); py_release(%s);" % (d, fn))
+                return t
         if isinstance(func, ast.Attribute):
             if isinstance(func.value, ast.Call) and \
                     isinstance(func.value.func, ast.Name) and \
@@ -1847,6 +1988,17 @@ class FnEmitter:
                 any(isinstance(a, ast.Starred) for a in node.args):
             warn("unsupported super() call", node)
             return None
+        if (base.id in EXC_KINDS or base.id in self.m.exception_classes) \
+                and attr == "__init__":
+            fake = ast.Call(
+                func=ast.Name(id="__super__", ctx=ast.Load()),
+                args=[ast.Name(id=self.self_arg, ctx=ast.Load())] + list(node.args),
+                keywords=list(node.keywords))
+            argv, argc, kw, owned = self.gen_call_args(fake)
+            self.release_call_args(owned, kw)
+            t = self.tmp()
+            self.e("PyVal *%s = py_none(); py_retain(%s);" % (t, t))
+            return t
         m = self.tmp()
         self.e("PyVal *%s = py_getattr(%s, %s);" %
                (m, self.m.global_c(base.id), cstr(attr)))
@@ -2039,6 +2191,7 @@ class ModuleEmitter:
         self.global_funcs = []
         self.func_map = {}
         self.class_map = {}
+        self.exception_classes = set()
         self._scan()
 
     # ------------------------------------------------------------- scanning
@@ -2156,6 +2309,10 @@ class ModuleEmitter:
     def add_class(self, node):
         cname = self.fn_names.take("cls_" + node.name)
         cs = ClassSpec(node, cname)
+        if any(isinstance(b, ast.Name) and
+               (b.id in EXC_KINDS or b.id in self.exception_classes)
+               for b in node.bases):
+            self.exception_classes.add(node.name)
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 m = self.add_method(stmt, node.name + "_" + stmt.name)
@@ -2377,7 +2534,7 @@ class ModuleEmitter:
         out.append("#define UNICODE")
         out.append("#define _UNICODE")
         out.append("#endif")
-        out.append("#include \"pyrt.h\"")
+        out.append("#include \"runtime/pyrt.h\"")
         out.append("#include <math.h>")
         out.append("#include <string.h>")
         out.append("#include <stdlib.h>")
@@ -2454,6 +2611,41 @@ class ModuleEmitter:
 # driver
 
 
+def imported_modules(tree):
+    """Return every module name referenced by import/import-from statements."""
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mods.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mods.add(node.module)
+    return mods
+
+
+def uses_gui(tree):
+    """True when the generated program can reach the Win32 tkinter shim."""
+    for mod in imported_modules(tree):
+        if mod == "tkinter" or mod.startswith("tkinter."):
+            return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in (
+                {"Tk", "Toplevel"} | set(WIDGET_KINDS) | VAR_CTORS):
+            return True
+    return False
+
+
+def uses_extra_builtins(tree):
+    """True when a program can reach a builtin from pyrt_builtins.c."""
+    mods = imported_modules(tree)
+    if "builtins" in mods or "__builtin__" in mods:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in EXTRA_BUILTIN_NAMES:
+            return True
+    return False
+
+
 def build(source, output, keep, verbose, run, extra_cflags, lto=False,
           quiet=False):
     try:
@@ -2479,17 +2671,34 @@ def build(source, output, keep, verbose, run, extra_cflags, lto=False,
             sys.stderr.write("py2c99: kept generated C at %s\n" % kept)
 
     gcc = os.environ.get("CC", "gcc")
+    gui = uses_gui(tree)
+    imports = imported_modules(tree)
+    need_extra = any(mod in EXTRA_MODULES for mod in imports)
+    need_builtins = uses_extra_builtins(tree)
+    defs = []
+    sources = [gen_path,
+               os.path.join(RUNTIME, "pyrt.c"),
+               os.path.join(RUNTIME, "pyrt_stdlib.c"),
+               os.path.join(RUNTIME, "pyrt_311.c")]
+    if need_builtins:
+        sources.append(os.path.join(RUNTIME, "pyrt_builtins.c"))
+    else:
+        defs.append("-DPY2C99_NO_EXTRA_BUILTINS")
+    if need_extra:
+        sources.append(os.path.join(RUNTIME, "pyrt_extra.c"))
+    else:
+        defs.append("-DPY2C99_NO_EXTRA_MODULES")
+    if gui:
+        sources.append(os.path.join(RUNTIME, "pyrt_win.c"))
+    else:
+        defs.append("-DPY2C99_NO_GUI")
     cmd = [gcc, "-std=c99", "-O3", "-s",
            "-ffunction-sections", "-fdata-sections",
            "-Wno-discarded-qualifiers",
-           "-municode", "-o", output,
-           gen_path,
-           os.path.join(RUNTIME, "pyrt.c"),
-           os.path.join(RUNTIME, "pyrt_stdlib.c"),
-           os.path.join(RUNTIME, "pyrt_win.c"),
+           "-municode", "-o", output] + defs + sources + [
            "-I", RUNTIME,
            "-Wl,--gc-sections",
-           "-luser32", "-lgdi32", "-lcomctl32", "-lm"]
+           "-luser32", "-lgdi32", "-lcomctl32", "-lws2_32", "-lm"]
     if lto:
         cmd.insert(3, "-flto")
     cmd.extend(extra_cflags)
